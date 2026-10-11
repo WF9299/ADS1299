@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "device": "ESP32-C5-ADS1299-R8",
+  "input_network": {
+    "model": "series_r_parallel_c_v1",
+    "series_ohm": 4990.0,
+    "shunt_capacitance_f": 4.7e-9,
+    "lead_off_frequency_hz": 31.25,
+    "max_parallel_fraction": 0.9
+  },
+  "channels": [
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false},
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false},
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false},
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false},
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false},
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false},
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false},
+    {"gain": 1.0, "offset_ohm": 0.0, "calibrated": false}
+  ]
+}

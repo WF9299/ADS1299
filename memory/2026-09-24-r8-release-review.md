@@ -1,0 +1,8 @@
+# R8 release review (2026-09-24)
+
+- User supplied a newer EasyEDA release archive at `C:\Users\TONG\Desktop\ProPrj_ADS1299_TONG_V2_R8_RELEASE_2026-09-21_2026-09-24.epro` and a ZIP containing the four-page schematic PDF.
+- The active board remains `PCB3_4L_L3_REBUILD_R8`; schematic sheets are 01_POWER, 02_ESP32_USB, 03_ADS1299 and 04_POWER_JUMPERS. The board still contains 212 components and 127 nets.
+- Relative to the 2026-09-21 R8 reconstruction export, the new board contains computed pour geometry: 32/32 zones have fills, with 37 fill fragments. Local top-layer -2.5V_AVSS routing changed; do not assume the release is merely a cached-fill export.
+- Hardware architecture: two-cell battery / RUN-CHARGE switch, separate USB host and system grounds, optically isolated UART0 via CP2102N and TLP2361, ESP32-C5-WROOM-1U-N8R8, ADS1299 with eight electrode inputs plus REF and BIAS, per-channel 4.99 kΩ input resistor and 4.7 nF to SRB1_REF, four power measurement jumpers.
+- Firmware-dependent detail: physical ADS1299 INxN pins are tied to +2.5V_AVDD; the common electrode reference enters SRB1, so firmware must configure SRB1 routing as intended. Manual EN/BOOT controls are shown; do not assume automatic download via CP2102N.
+- The supplied ZIP has schematic PDF only; no native DRC report or Gerber files were supplied in that attachment. On 2026-09-24 the user explicitly confirmed that the release passed DRC. This does not establish first-power-on behavior, analog performance or medical safety certification. Schematic warns to unplug USB before switching RUN/CHARGE and not connect body electrodes in CHARGE.

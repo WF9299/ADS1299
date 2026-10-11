@@ -1,0 +1,29 @@
+# Generated build output and downloaded ESP-IDF dependencies.
+/build/
+/firmware/build/
+/firmware/managed_components/
+*.bin
+*.elf
+*.map
+
+# Machine-specific editor configuration.
+.vscode/
+.clangd
+
+# Keep local Wi-Fi credentials out of Git. Copy the tracked example on a new clone.
+/firmware/components/app_config/include/app_config.h
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime/export files. The calibration JSON and partition CSV remain source files.
+__pycache__/
+*.py[cod]
+*.jsonl
+*.csv
+!/firmware/partitions.csv
+*.log
+*.tmp
