@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 
@@ -29,6 +30,13 @@ esp_err_t p300_stream_start(void);
 void p300_stream_stop(void);
 bool p300_stream_is_running(void);
 void p300_stream_get_stats(p300_stream_stats_t *stats);
+bool p300_stream_serial_control(const uint8_t *packet, size_t size);
+esp_err_t p300_stream_set_unix_time(uint64_t unix_us, uint64_t pc_monotonic_us);
+esp_err_t p300_stream_set_mode(bool wifi);
+bool p300_stream_wifi_mode(void);
+bool p300_stream_time_ready(void);
+esp_err_t p300_stream_restart(void);
+void p300_stream_pause_serial(void);
 
 #ifdef __cplusplus
 }

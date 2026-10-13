@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $componentsRoot = Join-Path $root 'components'
-$expectedComponents = @('ads1299', 'app_config', 'board_config', 'eeg_acq', 'native_wifi', 'p300_stream')
+$expectedComponents = @('ads1299', 'app_config', 'board_config', 'eeg_acq', 'native_wifi', 'p300_stream', 'runtime_config', 'serial_protocol', 'uart_link', 'device_manager')
 $actualComponents = @(Get-ChildItem -LiteralPath $componentsRoot -Directory | Select-Object -ExpandProperty Name | Sort-Object)
 $difference = @(Compare-Object ($expectedComponents | Sort-Object) $actualComponents)
 if ($difference.Count -ne 0) {
@@ -152,4 +152,12 @@ if (Test-Path -LiteralPath $lockFile) {
     }
 }
 
-Write-Host 'PASS: minimal C5 firmware scope, R8 pins/config, IDF pin, and protocol invariants'
+$wifi = Get-Content -LiteralPath (Join-Path $componentsRoot 'native_wifi\native_wifi.c') -Raw
+if ($wifi -match 'P300_WIFI_SSID|P300_WIFI_PASSWORD' -or $streamSource -match 'P300_TCP_SERVER_IP') {
+    throw 'Runtime networking must not consume hardcoded SSID/password/PC address.'
+}
+$main = Get-Content -LiteralPath (Join-Path $root 'main\main.c') -Raw
+if ($main.IndexOf('device_manager_start()') -gt $main.IndexOf('ads1299_init(') -or $main -match 'while\s*\(!native_wifi_is_connected') {
+    throw 'USB management must start before ADS bring-up; no Wi-Fi blocking startup.'
+}
+Write-Host 'PASS: C5 dual-transport scope, R8 pins, dynamic network, IDF pin and protocol invariants'

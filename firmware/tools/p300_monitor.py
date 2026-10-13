@@ -73,6 +73,9 @@ from tools.p300_signal_quality import (
     SignalQualityAnalyzer,
     mains_suppression_db,
 )
+from tools.p300_serial import SerialReceiver
+from tools.p300_discovery import DiscoveryServer
+from tools.p300_tx_control import TxControlClient, TxResultData, TxSetOutcome, TxStatus
 
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
@@ -271,6 +274,7 @@ class TcpReceiver(threading.Thread):
         self.bound_port: int | None = None
         self.dropped_events = 0
         self.parser_errors = 0
+        self.event_epoch = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -286,6 +290,8 @@ class TcpReceiver(threading.Thread):
                     pass
 
     def _emit(self, event: tuple) -> None:
+        if self.event_epoch is not None:
+            event = ("receiver_epoch", self.event_epoch, event)
         try:
             self.events.put_nowait(event)
         except queue.Full:
@@ -377,10 +383,14 @@ if QtWidgets is not None:
             http_settings_path: Path | str = DEFAULT_HTTP_SETTINGS_PATH,
             *,
             auto_start: bool = True,
+            discovery_port: int = 1236,
         ) -> None:
             super().__init__()
             self.host = host
             self.port = int(port)
+            self.discovery_port = int(discovery_port)
+            if not 1 <= self.discovery_port <= 65535:
+                raise ValueError("discovery_port must be in 1..65535")
             self.impedance_port = int(impedance_port)
             self.calibration_path = Path(calibration_path)
             self.http_settings_path = Path(http_settings_path)
@@ -400,6 +410,13 @@ if QtWidgets is not None:
             self.filter_error: str | None = None
             self.events: queue.Queue = queue.Queue(maxsize=4000)
             self.receiver: TcpReceiver | None = None
+            self.data_transport = "wifi"
+            self.discovery = None
+            self.active_receiver_epoch = None
+            self.tx_client = None
+            self.tx_actual_frames = None
+            self.tx_pending = False
+            self.tx_last_request_id = None
             self.writer: JsonlWriter | None = None
             self.current_record_path: Path | None = None
             self.force_markers_enabled = False
@@ -581,7 +598,7 @@ if QtWidgets is not None:
                 wave_layout.addWidget(plot, 1)
 
             self.side_panel = QtWidgets.QWidget()
-            self.side_panel.setMinimumWidth(620)
+            self.side_panel.setMinimumWidth(680)
             side_layout = QtWidgets.QVBoxLayout(self.side_panel)
             side_layout.setContentsMargins(0, 0, 0, 0)
             self.main_splitter.addWidget(self.side_panel)
@@ -589,13 +606,13 @@ if QtWidgets is not None:
             self.main_splitter.setStretchFactor(1, 0)
             self.main_splitter.setSizes([1060, 700])
 
-            connection = QtWidgets.QGroupBox("TCP EEG 输入")
+            connection = QtWidgets.QGroupBox("EEG 输入：TCP / USB 串口")
             connection_layout = QtWidgets.QGridLayout(connection)
             self.bind_edit = QtWidgets.QLineEdit(self.host)
             self.port_edit = QtWidgets.QSpinBox()
             self.port_edit.setRange(0, 65535)
             self.port_edit.setValue(self.port)
-            self.listen_button = QtWidgets.QPushButton("停止监听")
+            self.listen_button = QtWidgets.QPushButton("开始监听")
             self.listen_button.clicked.connect(self._toggle_receiver)
             self.remote_label = QtWidgets.QLabel("远端：--")
             self.device_label = QtWidgets.QLabel("设备：--")
@@ -606,6 +623,13 @@ if QtWidgets is not None:
             connection_layout.addWidget(self.listen_button, 1, 0, 1, 2)
             connection_layout.addWidget(self.remote_label, 1, 2, 1, 2)
             connection_layout.addWidget(self.device_label, 2, 0, 1, 4)
+            self.tx_control_button = QtWidgets.QPushButton("发送分组：重新查询")
+            self.tx_control_button.clicked.connect(self._toggle_tx_control)
+            self.tx_control_status = QtWidgets.QLabel("发送分组未确认")
+            self.tx_control_status.setWordWrap(True)
+            connection_layout.addWidget(self.tx_control_button, 3, 0, 1, 2)
+            connection_layout.addWidget(self.tx_control_status, 3, 2, 1, 2)
+            self._update_tx_control()
             side_layout.addWidget(connection)
 
             self.big_status = QtWidgets.QLabel("STOPPED")
@@ -627,7 +651,7 @@ if QtWidgets is not None:
                 ("lost", "序号丢样"), ("crc", "帧错误"),
                 ("stream", "stream_id"), ("interrupt", "有意中断"),
                 ("marker", "最近 Marker"), ("queue", "事件队列"),
-                ("tx", "TCP发送"),
+                ("tx", "发送分组"),
             )
             for index, (key, title) in enumerate(metric_names):
                 row, column = divmod(index, 2)
@@ -644,6 +668,12 @@ if QtWidgets is not None:
             self.tabs.addTab(self._build_self_test_tab(), "内部短接")
             self.tabs.addTab(self._build_record_tab(), "记录")
             self.tabs.addTab(self._build_quality_tab(), "质量")
+            from tools.p300_connection_ui import ConnectionPanel
+            self.network_panel = ConnectionPanel(self)
+            connection_scroll = QtWidgets.QScrollArea()
+            connection_scroll.setWidgetResizable(True)
+            connection_scroll.setWidget(self.network_panel)
+            self.tabs.addTab(connection_scroll, "连接/配网")
             side_layout.addWidget(self.tabs, 1)
 
         def _build_fft_tab(self) -> QtWidgets.QWidget:
@@ -710,20 +740,27 @@ if QtWidgets is not None:
                     self._set_table_item(channel, column, "--")
             layout.addWidget(self.impedance_table, 1)
 
-            calibration_group = QtWidgets.QGroupBox("每通道两点校准（输入固件原始值）")
+            calibration_group = QtWidgets.QGroupBox("两点校准：板载4.99 kΩ不更换")
+            self.calibration_group = calibration_group
             calibration_layout = QtWidgets.QGridLayout(calibration_group)
             self.calibration_channel = QtWidgets.QComboBox()
             self.calibration_channel.addItems([f"CH{index + 1}" for index in range(CHANNELS)])
             self.calibration_low = QtWidgets.QDoubleSpinBox()
             self.calibration_high = QtWidgets.QDoubleSpinBox()
-            for spin, value in ((self.calibration_low, 14.989), (self.calibration_high, 51.930)):
-                spin.setRange(0.001, 10000.0)
+            for spin, value in ((self.calibration_low, 0.0), (self.calibration_high, 0.0)):
+                spin.setRange(0.0, 10000.0)
                 spin.setDecimals(3)
                 spin.setValue(value)
                 spin.setSuffix(" kΩ")
+                spin.setSpecialValueText("未测量")
                 spin.setToolTip("填入接入对应已知电阻后，固件返回的原始kΩ值")
             self.apply_calibration_button = QtWidgets.QPushButton("应用10k/47k两点校准")
             self.apply_calibration_button.clicked.connect(self._apply_two_point_calibration)
+            self.apply_calibration_button.setEnabled(False)
+            def update_calibration_inputs():
+                self.apply_calibration_button.setEnabled(self.calibration_high.value()>self.calibration_low.value()>0)
+            self.calibration_low.valueChanged.connect(update_calibration_inputs)
+            self.calibration_high.valueChanged.connect(update_calibration_inputs)
             self.load_calibration_button = QtWidgets.QPushButton("加载校准")
             self.load_calibration_button.clicked.connect(self._load_calibration_dialog)
             self.save_calibration_button = QtWidgets.QPushButton("保存校准")
@@ -737,6 +774,9 @@ if QtWidgets is not None:
             self.calibration_status = QtWidgets.QLabel(str(self.calibration_path))
             self.calibration_status.setWordWrap(True)
             calibration_layout.addWidget(self.calibration_status, 3, 0, 1, 3)
+            self.calibration_explanation = QtWidgets.QLabel("断开人体电极，在外部 EEGn 与 REF 之间分别接入 10 kΩ、47 kΩ，检测后填入对应固件原始值；板载 4.99 kΩ 不更换。")
+            self.calibration_explanation.setWordWrap(True)
+            calibration_layout.addWidget(self.calibration_explanation, 4, 0, 1, 3)
             layout.addWidget(calibration_group)
 
             bias_group = QtWidgets.QGroupBox("BIAS / 右腿驱动通道")
@@ -1008,7 +1048,7 @@ if QtWidgets is not None:
 
         def _update_http_controls(self) -> None:
             active = self.http_sender is not None
-            blocked = self.self_test_active or self.self_test_pending or self.bias_pending
+            blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.tx_pending
             self.http_button.setEnabled(active or not blocked)
             self.http_ip_edit.setEnabled(not active)
             self.http_port_edit.setEnabled(not active)
@@ -1159,15 +1199,43 @@ if QtWidgets is not None:
                 return
             self.host = self.bind_edit.text().strip() or "0.0.0.0"
             self.port = int(self.port_edit.value())
-            self.receiver = TcpReceiver(self.host, self.port, self.events)
+            self.active_receiver_epoch = object()
+            if self.data_transport == "serial":
+                session = self.network_panel.session
+                if session is None or not session.connected:
+                    self._set_state("error", "请到连接/配网页连接 USB，再应用串口模式")
+                    return
+                self.receiver = SerialReceiver(session, self.events)
+            else:
+                self.receiver = TcpReceiver(self.host, self.port, self.events)
+                self.discovery = DiscoveryServer(
+                    self.network_panel.pairing,
+                    lambda: getattr(self.receiver, "bound_port", None) or self.port,
+                    self.events,
+                    port=self.discovery_port,
+                )
+                self.discovery.event_epoch = self.active_receiver_epoch
+                self.discovery.start()
+            self.receiver.event_epoch = self.active_receiver_epoch
             self.receiver.start()
-            self.listen_button.setText("停止监听")
+            self.listen_button.setText("停止串口 EEG" if self.data_transport == "serial" else "停止监听")
             self.bind_edit.setEnabled(False)
             self.port_edit.setEnabled(False)
             self._set_state("listening", f"正在启动 {self.host}:{self.port}")
 
         def _stop_receiver(self) -> None:
+            self.active_receiver_epoch = None
             self._stop_bias_client()
+            if self.tx_client is not None:
+                self.tx_client.stop()
+                self.tx_client.join(timeout=1)
+                self.tx_client = None
+            self.tx_actual_frames = None
+            self.tx_pending = False
+            if self.discovery is not None:
+                self.discovery.stop()
+                self.discovery.join(timeout=1)
+                self.discovery = None
             if self.receiver is not None:
                 self.receiver.stop()
                 self.receiver.join(timeout=2.0)
@@ -1191,6 +1259,78 @@ if QtWidgets is not None:
             self.port_edit.setEnabled(True)
             self.remote_label.setText("远端：--")
             self._set_state("stopped", "监听已停止")
+            self._update_impedance_button()
+            self._update_self_test_button()
+            self._update_record_controls()
+
+        def _pause_transport_output(self) -> None:
+            if self.writer is not None:
+                self._toggle_recording()
+            self._stop_http_push()
+            self._stop_receiver()
+
+        def _activate_transport(self, mode: str) -> None:
+            self.data_transport = mode
+            self._start_receiver()
+
+        def _control_exchange(self):
+            if self.data_transport == "serial":
+                session = self.network_panel.session
+                if session is None or not session.connected:
+                    raise RuntimeError("USB session unavailable")
+                return session.control_exchange
+            return None
+
+        def _set_tx_provisional_from_config(self) -> None:
+            self.tx_actual_frames = None
+            frames = int(self.model.config.get("tx_group_frames", 1))
+            self.tx_control_status.setText(f"数据配置：{frames}帧 / {20*frames} ms（需查询确认）")
+            self._update_tx_control()
+
+        def _update_tx_control(self) -> None:
+            enabled = (self.connected and self.has_valid_eeg and self.peer_ip is not None
+                and not self.tx_pending and not self.bias_pending and not self.self_test_pending
+                and not self.impedance_active and not self.restore_failed
+                and self.writer is None and self.http_sender is None)
+            self.tx_control_button.setEnabled(enabled)
+            if self.tx_actual_frames not in (1, 2):
+                self.tx_control_button.setText("发送分组：重新查询")
+            else:
+                target = 3-self.tx_actual_frames
+                self.tx_control_button.setText(f"切换为 {target}帧 / {20*target} ms")
+
+        def _toggle_tx_control(self) -> None:
+            if not self.tx_control_button.isEnabled():
+                return
+            if self.tx_client is not None:
+                self.tx_client.stop()
+                self.tx_client.join(timeout=.1)
+            self.tx_client = TxControlClient(self.peer_ip, events=self.events, exchange=self._control_exchange())
+            self.tx_pending = True
+            self.tx_last_request_id = (self.tx_client.start_query() if self.tx_actual_frames is None
+                else self.tx_client.start_set(3-self.tx_actual_frames))
+            self._update_tx_control()
+            self._update_impedance_button()
+            self._update_self_test_button()
+            self._update_record_controls()
+
+        def _handle_tx_control_event(self, event: dict) -> None:
+            if event.get("request_id") != self.tx_last_request_id:
+                return
+            if event["state"] == "started":
+                return
+            self.tx_pending = False
+            result = event.get("result")
+            if isinstance(result, TxSetOutcome):
+                result = result.result
+            if isinstance(result, TxResultData) and result.status == TxStatus.OK and result.verified and result.actual_frames in (1, 2):
+                self.tx_actual_frames = result.actual_frames
+                self.model.config.update(tx_group_frames=result.actual_frames, tx_group_period_ms=20*result.actual_frames)
+                self.tx_control_status.setText(f"设备确认：{result.actual_frames}帧 / {20*result.actual_frames} ms")
+            else:
+                self.tx_actual_frames = None
+                self.tx_control_status.setText(event.get("message", "发送分组未确认，请重新查询"))
+            self._update_tx_control()
             self._update_impedance_button()
             self._update_self_test_button()
             self._update_record_controls()
@@ -1382,6 +1522,7 @@ if QtWidgets is not None:
                     timeout_s=0.3,
                     retries=2,
                     events=self.events,
+                    exchange=self._control_exchange(),
                 )
             return self.bias_client
 
@@ -1573,6 +1714,7 @@ if QtWidgets is not None:
                 self.connected and self.peer_ip is not None and not self.bias_pending
                 and not self.impedance_active and not self.self_test_active
                 and not self.self_test_pending and not self.restore_failed
+                and not self.tx_pending
             )
             set_unlocked = (
                 safe and self.has_valid_eeg and self.bias_actual_mask is not None
@@ -1687,7 +1829,23 @@ if QtWidgets is not None:
                     event = self.events.get_nowait()
                 except queue.Empty:
                     break
+                if event[0] == "receiver_epoch":
+                    if event[1] is not self.active_receiver_epoch:
+                        continue
+                    event = event[2]
                 kind = event[0]
+                if kind in {"network_done", "usb_status", "usb_error", "usb_sync"}:
+                    self.network_panel.handle(kind, event[1])
+                    continue
+                if kind == "usb_log":
+                    self.network_panel.handle(kind, event[1])
+                    continue  # Diagnostic log never enters EEG/export.
+                if kind == "discovery_error":
+                    self.network_panel.operation_status.setText("配对发现不可用：" + event[1]["error"] + "；可经 USB 下发实际地址")
+                    continue
+                if kind == "discovery":
+                    self.network_panel.handle(kind, event[1])
+                    continue
                 if kind == "receiver":
                     state = event[1]["state"]
                     if state == "stopped" and self.receiver is not None and self.receiver.is_alive():
@@ -1728,6 +1886,7 @@ if QtWidgets is not None:
                         self._query_bias_mask()
                 elif kind == "config":
                     self.model.set_config(event[1])
+                    self._set_tx_provisional_from_config()
                     device = event[1].get("device", event[1].get("device_id", "ESP32-C5-ADS1299"))
                     self.device_label.setText(f"设备：{device}")
                 elif kind == "batch":
@@ -1763,16 +1922,16 @@ if QtWidgets is not None:
                         self.self_test_pending = False
                         self.self_test_pending_target = None
                         self.self_test_status.setText(
-                            f"TCP权威确认：config_id={batch.config_id}，stream_id=0x{batch.stream_id:08X}"
+                            f"{'USB' if self.data_transport == 'serial' else 'TCP'}权威确认：config_id={batch.config_id}，stream_id=0x{batch.stream_id:08X}"
                         )
                     if self.writer is not None and is_recordable_batch(batch):
                         self.writer.submit(record)
                     self._submit_http_batch(batch, record)
                     if not self.impedance_active:
                         if self.self_test_active:
-                            self._set_state("self_test", "内部短接数据接收正常；TCP config_id=2")
+                            self._set_state("self_test", f"内部短接数据接收正常；{'USB' if self.data_transport == 'serial' else 'TCP'} config_id=2")
                         else:
-                            self._set_state("eeg", "EEG数据接收正常；TCP config_id=1")
+                            self._set_state("eeg", f"EEG数据接收正常；{'USB' if self.data_transport == 'serial' else 'TCP'} config_id=1")
                     changed = True
                     self._update_impedance_button()
                     self._update_self_test_button()
@@ -1783,6 +1942,8 @@ if QtWidgets is not None:
                     self._handle_self_test_event(event[1])
                 elif kind == "bias":
                     self._handle_bias_event(event[1])
+                elif kind == "tx_control":
+                    self._handle_tx_control_event(event[1])
             if changed and not self.impedance_active:
                 self._refresh_plots()
             self._refresh_diagnostics()
@@ -1889,12 +2050,14 @@ if QtWidgets is not None:
                         f"记录：开启，批次 {self.writer.written}，写队列 {self.writer.queue.qsize()}，丢弃 {self.writer.dropped}"
                     )
             self._refresh_http_status()
+            self._update_tx_control()
 
         def _update_impedance_button(self) -> None:
             enabled = (
                 self.connected and self.has_valid_eeg and self.peer_ip is not None
                 and not self.impedance_active and not self.restore_failed
                 and not self.self_test_active and not self.self_test_pending
+                and not self.tx_pending
                 and not self.bias_pending
             )
             self.impedance_button.setEnabled(enabled)
@@ -1942,11 +2105,12 @@ if QtWidgets is not None:
                 and not self.self_test_pending
                 and not self.restore_failed
                 and not self.bias_pending
+                and not self.tx_pending
             )
             self.self_test_button.setEnabled(enabled)
 
         def _update_record_controls(self) -> None:
-            blocked = self.self_test_active or self.self_test_pending or self.bias_pending
+            blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.tx_pending
             self.record_button.setEnabled(self.writer is not None or not blocked)
             self.export_json_button.setEnabled(not blocked)
             self.export_csv_button.setEnabled(not blocked)
@@ -1967,6 +2131,7 @@ if QtWidgets is not None:
                 timeout_s=0.5,
                 retries=2,
                 events=self.events,
+                exchange=self._control_exchange(),
             )
             try:
                 request_id = self.self_test_client.start(target)
@@ -1978,7 +2143,7 @@ if QtWidgets is not None:
             self.http_aggregator.reset()
             action = "开启内部短接" if target == CONFIG_INTERNAL_SHORT else "恢复正常EEG"
             self.self_test_status.setText(
-                f"请求 0x{request_id:08X}：正在{action}，等待UDP结果及TCP config_id确认"
+                f"请求 0x{request_id:08X}：正在{action}，等待控制反馈及数据 config_id确认"
             )
             self._set_state("self_test", f"正在{action}")
             self._update_impedance_button()
@@ -2050,7 +2215,8 @@ if QtWidgets is not None:
             if not self.peer_ip or not self.impedance_button.isEnabled():
                 return
             self.impedance_client = ImpedanceClient(
-                self.peer_ip, self.impedance_port, timeout_s=5.0, retries=1, events=self.events
+                self.peer_ip, self.impedance_port, timeout_s=5.0, retries=1, events=self.events,
+                exchange=self._control_exchange(),
             )
             try:
                 request_id = self.impedance_client.start(0xFF)
@@ -2261,7 +2427,7 @@ if QtWidgets is not None:
         def smoke_validate(self) -> None:
             assert len(self.plots) == CHANNELS
             assert len(set(CHANNEL_COLORS)) == CHANNELS
-            assert self.tabs.count() == 5
+            assert self.tabs.count() == 6
             assert self.http_ip_edit.text() == self.http_settings.server_ip
             assert self.http_port_edit.value() == self.http_settings.port
             assert self.http_endpoint_edit.text() == self.http_settings.endpoint
@@ -2328,6 +2494,7 @@ if QtWidgets is not None:
                 self.self_test_client.stop()
                 self.self_test_client.join(timeout=1.0)
             self._stop_receiver()
+            self.network_panel.close()
             if self.writer is not None:
                 self.writer.close()
                 self.writer = None
@@ -2346,11 +2513,12 @@ def run_monitor(
     impedance_port: int = DEFAULT_IMPEDANCE_PORT,
     calibration_path: Path | str = DEFAULT_CALIBRATION_PATH,
     http_settings_path: Path | str = DEFAULT_HTTP_SETTINGS_PATH,
+    discovery_port: int = 1236,
 ) -> int:
     if QtWidgets is None:
         raise RuntimeError("PyQt5 and pyqtgraph are required; install tools/requirements-p300-tools.txt")
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    window = MonitorWindow(host, port, impedance_port, calibration_path, http_settings_path)
+    window = MonitorWindow(host, port, impedance_port, calibration_path, http_settings_path, discovery_port=discovery_port)
     if smoke_test:
         window.smoke_validate()
     window.show()
@@ -2363,6 +2531,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=1234)
+    parser.add_argument("--discovery-port", type=int, default=1236)
     parser.add_argument("--impedance-port", type=int, default=DEFAULT_IMPEDANCE_PORT)
     parser.add_argument("--calibration", default=str(DEFAULT_CALIBRATION_PATH))
     parser.add_argument("--http-settings", default=str(DEFAULT_HTTP_SETTINGS_PATH))
@@ -2376,6 +2545,7 @@ def main() -> None:
             args.impedance_port,
             args.calibration,
             args.http_settings,
+            args.discovery_port,
         )
     )
 

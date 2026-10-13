@@ -125,11 +125,11 @@ static void update_fit(p300_clock_model_t *model)
     model->valid = true;
 }
 
-bool p300_clock_add_measurement(p300_clock_model_t *model,
+bool p300_clock_add_measurement_limits(p300_clock_model_t *model,
                                 uint64_t t1_pc_us,
                                 uint64_t t2_esp_us,
                                 uint64_t t3_esp_us,
-                                uint64_t t4_pc_us)
+                                uint64_t t4_pc_us, uint32_t max_rtt, uint32_t slack)
 {
     if (model == NULL || t4_pc_us < t1_pc_us || t3_esp_us < t2_esp_us) {
         return false;
@@ -140,8 +140,8 @@ bool p300_clock_add_measurement(p300_clock_model_t *model,
         return false;
     }
     const uint32_t rtt_us = (uint32_t)(round_trip - server_time);
-    if (rtt_us > P300_SYNC_MAX_RTT_US ||
-        (model->count > 0 && rtt_us > model->min_rtt_us + P300_SYNC_MIN_RTT_SLACK_US)) {
+    if (rtt_us > max_rtt ||
+        (model->count > 0 && rtt_us > model->min_rtt_us + slack)) {
         return false;
     }
     const int64_t first = (int64_t)t2_esp_us - (int64_t)t1_pc_us;
@@ -163,6 +163,13 @@ bool p300_clock_add_measurement(p300_clock_model_t *model,
     }
     update_fit(model);
     return true;
+}
+
+bool p300_clock_add_measurement(p300_clock_model_t *model,
+    uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4)
+{
+    return p300_clock_add_measurement_limits(model,t1,t2,t3,t4,
+                                            P300_SYNC_MAX_RTT_US,P300_SYNC_MIN_RTT_SLACK_US);
 }
 
 bool p300_clock_is_valid(const p300_clock_model_t *model)

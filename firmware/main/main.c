@@ -1,6 +1,5 @@
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -11,6 +10,8 @@
 #include "eeg_acq.h"
 #include "native_wifi.h"
 #include "p300_stream.h"
+#include "runtime_config.h"
+#include "device_manager.h"
 
 static const char *TAG = "p300_acq";
 
@@ -24,20 +25,13 @@ static esp_err_t init_nvs(void)
     return err;
 }
 
-static void start_sntp(void)
-{
-    const esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(P300_SNTP_SERVER);
-    const esp_err_t err = esp_netif_sntp_init(&config);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "SNTP start failed: %s; TCP waits for valid Unix time", esp_err_to_name(err));
-    }
-}
-
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ADS1299 P300 firmware: 8ch %u SPS TCP EEG_BATCH v1",
+    ESP_LOGI(TAG, "ADS1299 P300 firmware: 8ch %u SPS USB/Wi-Fi EEG_BATCH v1",
              (unsigned)P300_SAMPLE_RATE_HZ);
     ESP_ERROR_CHECK(init_nvs());
+    ESP_ERROR_CHECK(runtime_config_init());
+    ESP_ERROR_CHECK(device_manager_start());
 
     const board_config_t board = board_default_config();
     board_log_config(&board);
@@ -47,12 +41,5 @@ void app_main(void)
         return;
     }
 
-    ESP_ERROR_CHECK(native_wifi_init());
-    while (!native_wifi_is_connected()) {
-        ESP_LOGI(TAG, "waiting for Wi-Fi station before TCP/marker services");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    start_sntp();
     ESP_ERROR_CHECK(p300_stream_start());
 }

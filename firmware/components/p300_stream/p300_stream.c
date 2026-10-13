@@ -13,6 +13,9 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "runtime_config.h"
+#include "uart_link.h"
 #include "native_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -119,6 +122,30 @@ static bool s_unix_ready;
 static p300_stream_stats_t s_stats;
 static p300_tx_group_t s_tx_group;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+typedef struct { uint32_t generation; size_t size; uint8_t packet[256]; } serial_control_t;
+static QueueHandle_t s_controls;
+static volatile int s_requested_mode = -1;
+static volatile bool s_wifi_mode;
+static bool s_serial_connected;
+static volatile bool s_serial_paused;
+static uint32_t s_serial_generation, s_serial_config_stream;
+static volatile uint64_t s_pending_unix, s_pending_pc;
+
+static bool data_connected(void)
+{ return s_wifi_mode ? s_tcp_sock >= 0 : s_serial_connected && uart_link_active(); }
+
+static int reply_packet(const struct sockaddr_in *source, socklen_t source_len,
+                        const uint8_t *packet, size_t length)
+{
+    if (source->sin_family == AF_UNSPEC) {
+        if (source->sin_addr.s_addr != uart_link_generation()) return -1;
+        uint32_t id = length>=8 ? ((uint32_t)packet[4]<<24 | (uint32_t)packet[5]<<16 |
+                                   (uint32_t)packet[6]<<8 | packet[7]) : 0;
+        return uart_link_send(SERIAL_CONTROL_REPLY,id,packet,length) ? (int)length : -1;
+    }
+    if (s_marker_sock < 0) return -1;
+    return sendto(s_marker_sock,packet,length,0,(const struct sockaddr *)source,source_len);
+}
 
 static uint32_t read_u32_be(const uint8_t *src)
 {
@@ -146,9 +173,11 @@ static void put_u32_be(uint8_t *dst, uint32_t value)
 static bool valid_tcp_target(struct sockaddr_in *target)
 {
     memset(target, 0, sizeof(*target));
+    char host[16]; uint16_t port;
+    if (!runtime_config_endpoint(host,&port)) return false;
     target->sin_family = AF_INET;
-    target->sin_port = htons(P300_TCP_PORT);
-    return inet_pton(AF_INET, P300_TCP_SERVER_IP, &target->sin_addr) == 1;
+    target->sin_port = htons(port);
+    return inet_pton(AF_INET, host, &target->sin_addr) == 1;
 }
 
 static bool is_transient_send_errno(int error)
@@ -177,14 +206,18 @@ static void close_tcp_socket(void)
 
 static bool source_is_tcp_target(const struct sockaddr_in *source)
 {
-    struct in_addr target_addr = {0};
+    if (source && source->sin_family == AF_UNSPEC)
+        return !s_wifi_mode && uart_link_active() && source->sin_addr.s_addr == uart_link_generation();
+    struct in_addr target_addr = {0}; char host[16]; uint16_t port;
     return source != NULL && source->sin_family == AF_INET &&
-           inet_pton(AF_INET, P300_TCP_SERVER_IP, &target_addr) == 1 &&
+           s_wifi_mode && runtime_config_endpoint(host,&port) &&
+           inet_pton(AF_INET, host, &target_addr) == 1 &&
            source->sin_addr.s_addr == target_addr.s_addr;
 }
 
 static void renew_stream_id(void)
 {
+    uart_link_new_stream();
     const uint32_t previous = s_stream_id;
     do {
         s_stream_id = esp_random();
@@ -228,11 +261,16 @@ static bool flush_tx_group(void)
     }
     const uint8_t frame_count = p300_tx_group_frame_count(&s_tx_group);
     const size_t byte_count = p300_tx_group_size(&s_tx_group);
-    if (s_tcp_sock < 0) {
+    if (!data_connected()) {
         p300_tx_group_clear(&s_tx_group);
         return false;
     }
-    const bool sent = send_all(p300_tx_group_data(&s_tx_group), byte_count);
+    bool sent=true;
+    if (s_wifi_mode) sent=send_all(p300_tx_group_data(&s_tx_group),byte_count);
+    else for (uint8_t i=0;i<frame_count;i++) {
+        const uint8_t *frame=p300_tx_group_data(&s_tx_group)+(size_t)i*P300_EEG_BATCH_BYTES;
+        if (!uart_link_send(SERIAL_EEG,read_u32_be(frame+10),frame,P300_EEG_BATCH_BYTES)) sent=false;
+    }
     if (sent) {
         portENTER_CRITICAL(&s_mux);
         s_stats.frames_sent += (uint32_t)frame_count * P300_EEG_BATCH_SAMPLES;
@@ -271,31 +309,19 @@ static bool queue_tx_frame(const p300_batch_t *batch,
            flush_tx_group();
 }
 
-static bool refresh_unix_offset(void)
-{
-    struct timeval now = {0};
-    gettimeofday(&now, NULL);
-    if (now.tv_sec < P300_MIN_UNIX_EPOCH) {
-        return false;
-    }
-    s_unix_offset_us = (int64_t)now.tv_sec * 1000000LL + now.tv_usec - esp_timer_get_time();
-    s_unix_ready = true;
-    return true;
-}
-
 static bool send_stream_config(void)
 {
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char config[512] = {0};
+    char config[640] = {0};
     const uint8_t tx_group_frames = active_tx_group_frames();
     const int length = snprintf(
         config, sizeof(config),
         "{\"type\":\"STREAM_CONFIG\",\"device_id\":\"P300_%02X%02X%02X%02X%02X%02X\","
-        "\"firmware_version\":\"P300_TCP_V1\",\"stream_id\":%" PRIu32 ",\"config_id\":%u,"
+        "\"firmware_version\":\"P300_DUAL_V1\",\"stream_id\":%" PRIu32 ",\"config_id\":%u,"
         "\"sample_rate_hz\":%u,\"channel_mask\":255,\"vref_v\":4.5,\"pga_gain\":12,"
         "\"reference\":\"ADS1299 internal reference\",\"bias\":\"enabled\","
-        "\"marker_codes\":{\"0\":\"none\",\"1\":\"p300\"},\"sync\":\"udp_four_timestamp\","
+        "\"marker_codes\":{\"0\":\"none\",\"1\":\"p300\"},\"sync\":\"pc_four_timestamp\","
         "\"tx_group_frames\":%u,\"tx_group_period_ms\":%u}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], s_stream_id,
         (unsigned)eeg_acq_get_config_id(),
@@ -307,6 +333,7 @@ static bool send_stream_config(void)
         return false;
     }
     uint8_t prefix[4];
+    if (!s_wifi_mode) return uart_link_send(SERIAL_CONFIG,0,config,(size_t)length);
     put_u32_be(prefix, (uint32_t)length);
     return send_all(prefix, sizeof(prefix)) && send_all((const uint8_t *)config, (size_t)length);
 }
@@ -333,8 +360,8 @@ static bool connect_tcp(const struct sockaddr_in *target)
     s_stats.connected = 1;
     s_stats.reconnects++;
     portEXIT_CRITICAL(&s_mux);
-    ESP_LOGI(TAG, "P300 TCP connected: %s:%u", P300_TCP_SERVER_IP,
-             (unsigned)P300_TCP_PORT);
+    ESP_LOGI(TAG, "P300 TCP connected: %s:%u", inet_ntoa(target->sin_addr),
+             (unsigned)ntohs(target->sin_port));
     return true;
 }
 
@@ -376,14 +403,12 @@ static void send_marker_ack(const pending_marker_t *pending,
                             uint32_t error_us)
 {
     uint8_t packet[P300_MARKER_ACK_BYTES];
-    if (s_marker_sock < 0 || pending == NULL) {
+    if (pending == NULL) {
         return;
     }
     const size_t length = p300_build_marker_ack(pending->event.event_id, status, sample_seq,
                                                  error_us, packet, sizeof(packet));
-    const int sent = sendto(s_marker_sock, packet, length, 0,
-                            (const struct sockaddr *)&pending->source,
-                            pending->source_len);
+    const int sent = reply_packet(&pending->source, pending->source_len, packet, length);
     portENTER_CRITICAL(&s_mux);
     if (sent == (int)length) {
         s_stats.udp_packets_sent++;
@@ -412,7 +437,7 @@ static void send_impedance_result(const struct sockaddr_in *source,
                                   const p300_impedance_result_t *result,
                                   bool cached)
 {
-    if (s_marker_sock < 0 || source == NULL || result == NULL) {
+    if (source == NULL || result == NULL) {
         return;
     }
     p300_impedance_result_t reply = *result;
@@ -421,8 +446,7 @@ static void send_impedance_result(const struct sockaddr_in *source,
     }
     uint8_t packet[P300_IMPEDANCE_RESULT_BYTES];
     const size_t length = p300_build_impedance_result(&reply, packet, sizeof(packet));
-    const int sent = sendto(s_marker_sock, packet, length, 0,
-                            (const struct sockaddr *)source, source_len);
+    const int sent = reply_packet(source, source_len, packet, length);
     portENTER_CRITICAL(&s_mux);
     if (sent == (int)length) {
         s_stats.udp_packets_sent++;
@@ -452,7 +476,7 @@ static void send_self_test_result(const struct sockaddr_in *source,
                                   const p300_self_test_result_t *result,
                                   bool cached)
 {
-    if (s_marker_sock < 0 || source == NULL || result == NULL) {
+    if (source == NULL || result == NULL) {
         return;
     }
     p300_self_test_result_t reply = *result;
@@ -461,8 +485,7 @@ static void send_self_test_result(const struct sockaddr_in *source,
     }
     uint8_t packet[P300_SELF_TEST_RESULT_BYTES];
     const size_t length = p300_build_self_test_result(&reply, packet, sizeof(packet));
-    const int sent = sendto(s_marker_sock, packet, length, 0,
-                            (const struct sockaddr *)source, source_len);
+    const int sent = reply_packet(source, source_len, packet, length);
     portENTER_CRITICAL(&s_mux);
     if (sent == (int)length) {
         s_stats.udp_packets_sent++;
@@ -493,13 +516,12 @@ static void send_bias_result(const struct sockaddr_in *source,
                              socklen_t source_len,
                              const p300_bias_control_result_t *result)
 {
-    if (s_marker_sock < 0 || source == NULL || result == NULL) {
+    if (source == NULL || result == NULL) {
         return;
     }
     uint8_t packet[P300_BIAS_CONTROL_RESULT_BYTES];
     const size_t length = p300_build_bias_control_result(result, packet, sizeof(packet));
-    const int sent = sendto(s_marker_sock, packet, length, 0,
-                            (const struct sockaddr *)source, source_len);
+    const int sent = reply_packet(source, source_len, packet, length);
     portENTER_CRITICAL(&s_mux);
     if (sent == (int)length) {
         s_stats.udp_packets_sent++;
@@ -521,7 +543,7 @@ static p300_tx_control_result_t tx_control_status_result(
         .requested_frames = requested_frames,
         .actual_frames = actual_frames,
         .flags = P300_TX_FLAG_VERIFIED,
-        .stream_id = s_tcp_sock >= 0 ? s_stream_id : 0U,
+        .stream_id = data_connected() ? s_stream_id : 0U,
     };
     return result;
 }
@@ -530,14 +552,13 @@ static void send_tx_control_result(const struct sockaddr_in *source,
                                    socklen_t source_len,
                                    const p300_tx_control_result_t *result)
 {
-    if (s_marker_sock < 0 || source == NULL || result == NULL) {
+    if (source == NULL || result == NULL) {
         return;
     }
     uint8_t packet[P300_TX_CONTROL_RESULT_BYTES];
     const size_t length =
         p300_build_tx_control_result(result, packet, sizeof(packet));
-    const int sent = sendto(s_marker_sock, packet, length, 0,
-                            (const struct sockaddr *)source, source_len);
+    const int sent = reply_packet(source, source_len, packet, length);
     portENTER_CRITICAL(&s_mux);
     if (sent == (int)length) {
         s_stats.udp_packets_sent++;
@@ -704,7 +725,7 @@ static void handle_bias_control_request(const uint8_t *packet,
         return;
     }
 
-    const bool tcp_authorized = s_tcp_sock >= 0 && source_is_tcp_target(source);
+    const bool tcp_authorized = data_connected() && source_is_tcp_target(source);
     if (parse_status == P300_BIAS_PARSE_INVALID) {
         const p300_bias_control_result_t invalid = bias_status_result(
             request.request_id,
@@ -755,7 +776,7 @@ static void handle_tx_control_request(const uint8_t *packet,
     }
 
     const bool tcp_authorized =
-        s_tcp_sock >= 0 && source_is_tcp_target(source);
+        data_connected() && source_is_tcp_target(source);
     if (parse_status == P300_TX_PARSE_INVALID) {
         const p300_tx_control_result_t invalid = tx_control_status_result(
             request.request_id,
@@ -900,13 +921,7 @@ static p300_impedance_result_t run_impedance_measurement(const pending_impedance
 
     if (measured.tested_mask != 0U &&
         measured.status != EEG_ACQ_IMPEDANCE_STATUS_RESTORE_FAILED) {
-        const uint32_t previous = s_stream_id;
-        do {
-            s_stream_id = esp_random();
-        } while (s_stream_id == 0U || s_stream_id == previous);
-        portENTER_CRITICAL(&s_mux);
-        s_stats.intentional_interrupts++;
-        portEXIT_CRITICAL(&s_mux);
+        renew_stream_id();
     }
     return result;
 }
@@ -947,7 +962,7 @@ static void handle_self_test_request(const uint8_t *packet,
         send_self_test_result(source, source_len, &invalid, false);
         return;
     }
-    if (s_tcp_sock < 0) {
+    if (!data_connected()) {
         const p300_self_test_result_t unavailable = self_test_status_result(
             request.request_id,
             P300_SELF_TEST_STATUS_NO_TCP_STREAM,
@@ -1051,7 +1066,7 @@ static void run_and_complete_tx_control_request(
     const active_tx_request_t *request)
 {
     const uint8_t old_frames = active_tx_group_frames();
-    const bool flushed = s_tcp_sock >= 0 && flush_tx_group();
+    const bool flushed = data_connected() && flush_tx_group();
     p300_tx_control_result_t result = {0};
     portENTER_CRITICAL(&s_mux);
     if (flushed) {
@@ -1219,6 +1234,40 @@ static void restore_normal_after_disconnect(void)
     }
 }
 
+static void dispatch_control(const uint8_t *packet, size_t received,
+                             const struct sockaddr_in *source, socklen_t source_len)
+{
+    if (received<4 || packet[0]!=0xa5 || packet[1]!=0x51 || packet[2]!=1 ||
+        !source_is_tcp_target(source)) return;
+    if (packet[3]==P300_UDP_TYPE_SYNC_REQ && received==16) {
+        uint8_t reply[P300_SYNC_REPLY_BYTES];
+        uint64_t t2=esp_timer_get_time();
+        size_t size=p300_build_sync_reply(read_u32_be(packet+4),read_u64_be(packet+8),
+                                         t2,esp_timer_get_time(),reply,sizeof(reply));
+        reply_packet(source,source_len,reply,size);
+    } else if (packet[3]==P300_UDP_TYPE_SYNC_RESULT) {
+        p300_sync_measurement_t m={0};
+        if (p300_parse_sync_result_packet(packet,received,&m)) {
+            portENTER_CRITICAL(&s_mux);
+            if (s_clock_last_update_us>0 && esp_timer_get_time()-s_clock_last_update_us>P300_SYNC_MAX_AGE_US)
+                memset(&s_clock,0,sizeof(s_clock));
+            bool serial=source->sin_family==AF_UNSPEC;
+            if (p300_clock_add_measurement_limits(&s_clock,m.t1_pc_us,m.t2_esp_us,m.t3_esp_us,m.t4_pc_us,
+                serial?50000U:P300_SYNC_MAX_RTT_US, serial?5000U:P300_SYNC_MIN_RTT_SLACK_US))
+                s_clock_last_update_us=esp_timer_get_time();
+            portEXIT_CRITICAL(&s_mux);
+        }
+    } else if (packet[3]==14 && received==28 && p300_crc32c(packet,24)==read_u32_be(packet+24)) {
+        p300_stream_set_unix_time(read_u64_be(packet+8),read_u64_be(packet+16));
+    } else if (packet[3]==P300_UDP_TYPE_MARKER) {
+        p300_marker_event_t event={0};
+        if (p300_parse_marker_packet(packet,received,&event)) enqueue_marker(&event,source,source_len);
+    } else if (packet[3]==P300_UDP_TYPE_IMPEDANCE_REQUEST) handle_impedance_request(packet,received,source,source_len);
+    else if (packet[3]==P300_UDP_TYPE_SELF_TEST_REQUEST) handle_self_test_request(packet,received,source,source_len);
+    else if (packet[3]==P300_UDP_TYPE_BIAS_CONTROL_REQUEST) handle_bias_control_request(packet,received,source,source_len);
+    else if (packet[3]==P300_UDP_TYPE_TX_CONTROL_REQUEST) handle_tx_control_request(packet,received,source,source_len);
+}
+
 static void marker_task(void *arg)
 {
     (void)arg;
@@ -1244,41 +1293,11 @@ static void marker_task(void *arg)
         socklen_t source_len = sizeof(source);
         const int received = recvfrom(s_marker_sock, packet, sizeof(packet), 0,
                                       (struct sockaddr *)&source, &source_len);
-        if (received > 0 && packet[0] == 0xA5 && packet[1] == 0x51 && packet[2] == 1) {
-            if (packet[3] == P300_UDP_TYPE_SYNC_REQ && received == 16) {
-                uint8_t reply[P300_SYNC_REPLY_BYTES];
-                const uint64_t t2 = esp_timer_get_time();
-                const size_t length = p300_build_sync_reply(read_u32_be(&packet[4]), read_u64_be(&packet[8]),
-                                                            t2, esp_timer_get_time(), reply, sizeof(reply));
-                sendto(s_marker_sock, reply, length, 0, (const struct sockaddr *)&source, source_len);
-            } else if (packet[3] == P300_UDP_TYPE_SYNC_RESULT) {
-                p300_sync_measurement_t measurement = {0};
-                if (p300_parse_sync_result_packet(packet, (size_t)received, &measurement)) {
-                    if (s_clock_last_update_us > 0 &&
-                        esp_timer_get_time() - s_clock_last_update_us > P300_SYNC_MAX_AGE_US) {
-                        memset(&s_clock, 0, sizeof(s_clock));
-                        s_clock_last_update_us = 0;
-                    }
-                    if (p300_clock_add_measurement(&s_clock, measurement.t1_pc_us,
-                                                   measurement.t2_esp_us, measurement.t3_esp_us,
-                                                   measurement.t4_pc_us)) {
-                        s_clock_last_update_us = esp_timer_get_time();
-                    }
-                }
-            } else if (packet[3] == P300_UDP_TYPE_MARKER) {
-                p300_marker_event_t event = {0};
-                if (p300_parse_marker_packet(packet, (size_t)received, &event)) {
-                    enqueue_marker(&event, &source, source_len);
-                }
-            } else if (packet[3] == P300_UDP_TYPE_IMPEDANCE_REQUEST) {
-                handle_impedance_request(packet, (size_t)received, &source, source_len);
-            } else if (packet[3] == P300_UDP_TYPE_SELF_TEST_REQUEST) {
-                handle_self_test_request(packet, (size_t)received, &source, source_len);
-            } else if (packet[3] == P300_UDP_TYPE_BIAS_CONTROL_REQUEST) {
-                handle_bias_control_request(packet, (size_t)received, &source, source_len);
-            } else if (packet[3] == P300_UDP_TYPE_TX_CONTROL_REQUEST) {
-                handle_tx_control_request(packet, (size_t)received, &source, source_len);
-            }
+        if (received>0) dispatch_control(packet,(size_t)received,&source,source_len);
+        serial_control_t usb;
+        while (xQueueReceive(s_controls,&usb,0)==pdTRUE) {
+            struct sockaddr_in serial={.sin_family=AF_UNSPEC,.sin_addr.s_addr=usb.generation};
+            dispatch_control(usb.packet,usb.size,&serial,0);
         }
         process_pending_markers();
     }
@@ -1295,14 +1314,32 @@ static void stream_task(void *arg)
 {
     (void)arg;
     struct sockaddr_in target = {0};
-    if (!valid_tcp_target(&target)) {
-        vTaskDelete(NULL);
-    }
     p300_batch_t building = {0};
     uint8_t building_count = 0;
     int64_t last_connect_us = 0;
     while (!s_stop_requested) {
         const int64_t loop_now_us = esp_timer_get_time();
+        if (s_requested_mode>=0) {
+            close_tcp_socket(); s_serial_connected=false;
+            building_count=0; memset(&building,0,sizeof(building)); clear_batch_fifo();
+            if (eeg_acq_get_config_id()!=EEG_ACQ_CONFIG_NORMAL) restore_normal_after_disconnect();
+            portENTER_CRITICAL(&s_mux);
+            memset(&s_pending,0,sizeof(s_pending)); memset(&s_dedup,0,sizeof(s_dedup));
+            memset(&s_clock,0,sizeof(s_clock)); s_clock_last_update_us=0;
+            s_unix_ready=false; s_pending_unix=0;
+            portEXIT_CRITICAL(&s_mux);
+            s_wifi_mode=s_requested_mode==1; runtime_config_set_mode(s_wifi_mode);
+            s_serial_paused=false;
+            renew_stream_id(); s_serial_config_stream=0; s_requested_mode=-1;
+        }
+        bool serial_alive=uart_link_active();
+        if (!s_wifi_mode && s_serial_connected && (!serial_alive || s_serial_generation!=uart_link_generation())) {
+            s_serial_connected=false; s_unix_ready=false; clear_batch_fifo();
+            s_restore_normal_requested=true;
+            portENTER_CRITICAL(&s_mux); memset(&s_clock,0,sizeof(s_clock));
+            s_clock_last_update_us=0; portEXIT_CRITICAL(&s_mux);
+            renew_stream_id();
+        }
         if (p300_tx_group_due(&s_tx_group, loop_now_us,
                               P300_TCP_COALESCE_MAX_WAIT_MS)) {
             flush_tx_group();
@@ -1321,8 +1358,16 @@ static void stream_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        if (!s_unix_ready) {
-            refresh_unix_offset();
+        portENTER_CRITICAL(&s_mux);
+        if (!s_unix_ready && s_pending_unix) {
+            s_unix_offset_us=(int64_t)s_pending_unix-(int64_t)s_pending_pc;
+            s_unix_ready=true; s_pending_unix=0;
+        }
+        portEXIT_CRITICAL(&s_mux);
+        if (!s_wifi_mode && !s_serial_paused && serial_alive && s_unix_ready &&
+            (!s_serial_connected || s_serial_config_stream!=s_stream_id)) {
+            s_serial_connected=send_stream_config();
+            if (s_serial_connected) { s_serial_config_stream=s_stream_id; s_serial_generation=uart_link_generation(); }
         }
         eeg_acq_sample_t source;
         while (building_count < P300_EEG_BATCH_SAMPLES && eeg_acq_pop(&source)) {
@@ -1378,12 +1423,12 @@ static void stream_task(void *arg)
             run_and_complete_tx_control_request(&tx_control_request);
             continue;
         }
-        if (s_tcp_sock < 0 && now_us - last_connect_us >= P300_RECONNECT_MS * 1000LL) {
+        if (s_wifi_mode && s_tcp_sock < 0 && now_us - last_connect_us >= P300_RECONNECT_MS * 1000LL) {
             last_connect_us = now_us;
-            connect_tcp(&target);
+            if (valid_tcp_target(&target)) connect_tcp(&target);
         }
         p300_batch_t batch = {0};
-        if (s_tcp_sock >= 0 && take_ready_batch(&batch, now_us)) {
+        if (data_connected() && take_ready_batch(&batch, now_us)) {
             uint8_t frame[P300_EEG_BATCH_BYTES];
             const size_t length = p300_encode_eeg_batch(s_stream_id, batch.config_id,
                                                          (uint64_t)s_unix_offset_us,
@@ -1407,6 +1452,9 @@ esp_err_t p300_stream_start(void)
         return ESP_OK;
     }
     s_stop_requested = false;
+    s_wifi_mode=runtime_config_wifi_mode();
+    s_controls=xQueueCreate(12,sizeof(serial_control_t));
+    if (!s_controls) return ESP_ERR_NO_MEM;
     do {
         s_stream_id = esp_random();
     } while (s_stream_id == 0U);
@@ -1464,5 +1512,59 @@ void p300_stream_get_stats(p300_stream_stats_t *stats)
     }
     portENTER_CRITICAL(&s_mux);
     *stats = s_stats;
+    stats->connected=data_connected();
     portEXIT_CRITICAL(&s_mux);
+}
+
+bool p300_stream_serial_control(const uint8_t *packet,size_t size)
+{
+    if (!s_controls || size>256) return false;
+    serial_control_t command={.generation=uart_link_generation(),.size=size};
+    memcpy(command.packet,packet,size);
+    return xQueueSend(s_controls,&command,0)==pdTRUE;
+}
+esp_err_t p300_stream_set_unix_time(uint64_t unix_us,uint64_t pc_us)
+{
+    if (unix_us<(uint64_t)P300_MIN_UNIX_EPOCH*1000000ULL) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_mux);
+    bool valid=p300_clock_is_valid(&s_clock) && esp_timer_get_time()-s_clock_last_update_us<P300_SYNC_MAX_AGE_US;
+    if (valid && !s_unix_ready) { s_pending_pc=p300_clock_pc_to_esp(&s_clock,pc_us); s_pending_unix=unix_us; }
+    portEXIT_CRITICAL(&s_mux);
+    return valid?ESP_OK:ESP_ERR_INVALID_STATE;
+}
+esp_err_t p300_stream_set_mode(bool wifi)
+{
+    if (!s_stream_task) return ESP_ERR_INVALID_STATE;
+    if (wifi==s_wifi_mode) return ESP_OK;
+    portENTER_CRITICAL(&s_mux);
+    bool busy=s_requested_mode>=0 || s_impedance.active || s_impedance.pending ||
+        s_self_test.active || s_self_test.pending || s_bias_state.active || s_bias_state.pending;
+    if (!busy) s_requested_mode=wifi?1:0;
+    portEXIT_CRITICAL(&s_mux);
+    if (busy) return ESP_ERR_INVALID_STATE;
+    for (int i=0;i<200 && s_requested_mode>=0;i++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_requested_mode>=0) { s_requested_mode=-1; return ESP_ERR_TIMEOUT; }
+    return s_wifi_mode==wifi?ESP_OK:ESP_FAIL;
+}
+bool p300_stream_wifi_mode(void) { return s_wifi_mode; }
+bool p300_stream_time_ready(void) { return s_unix_ready; }
+void p300_stream_pause_serial(void)
+{
+    if (!s_wifi_mode) {
+        s_serial_paused=true; s_serial_connected=false; s_restore_normal_requested=true;
+        uart_link_new_stream();
+    }
+}
+esp_err_t p300_stream_restart(void)
+{
+    if (!s_stream_task) return ESP_ERR_INVALID_STATE;
+    portENTER_CRITICAL(&s_mux);
+    bool busy=s_requested_mode>=0 || s_impedance.active || s_impedance.pending ||
+        s_self_test.active || s_self_test.pending || s_bias_state.active || s_bias_state.pending;
+    if (!busy) s_requested_mode=s_wifi_mode?1:0;
+    portEXIT_CRITICAL(&s_mux);
+    if (busy) return ESP_ERR_INVALID_STATE;
+    for (int i=0;i<200 && s_requested_mode>=0;i++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_requested_mode>=0) { s_requested_mode=-1; return ESP_ERR_TIMEOUT; }
+    return ESP_OK;
 }

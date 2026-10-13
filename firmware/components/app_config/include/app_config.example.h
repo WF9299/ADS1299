@@ -1,7 +1,7 @@
 #pragma once
 
-/* Copy to app_config.h and fill in your local network settings before building. */
-/* app_config.h is intentionally ignored by Git because it contains credentials. */
+/* Copy to app_config.h for acquisition/algorithm settings before building. */
+/* Wi-Fi and PC endpoint are configured through USB and saved in device NVS. */
 
 /* ADS1299 acquisition */
 #define P300_SAMPLE_RATE_HZ                     1000U
@@ -17,16 +17,7 @@
 #define P300_IMPEDANCE_MEASURE_SAMPLES          1024U
 #define P300_IMPEDANCE_FRAME_TIMEOUT_MS         10U
 
-/* ESP32-C5 native Wi-Fi station. */
-#define P300_WIFI_SSID                          "YOUR_WIFI_SSID"
-#define P300_WIFI_PASSWORD                      "YOUR_WIFI_PASSWORD"
-#define P300_WIFI_STATIC_IP_ENABLE              0
-#define P300_WIFI_STATIC_IP                     "0.0.0.0"
-#define P300_WIFI_STATIC_GATEWAY                "0.0.0.0"
-#define P300_WIFI_STATIC_NETMASK                "0.0.0.0"
-
-/* ESP32 is the TCP client; use the PC's reachable network address here. */
-#define P300_TCP_SERVER_IP                      "192.168.137.1"
+/* Default ports; no fixed SSID, password or PC address. */
 #define P300_TCP_PORT                           1234U
 #define P300_MARKER_PORT                        1235U
 #define P300_SNTP_SERVER                        "pool.ntp.org"

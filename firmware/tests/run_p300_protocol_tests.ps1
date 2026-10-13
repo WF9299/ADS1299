@@ -25,6 +25,7 @@ if ($null -eq $gcc) {
 }
 
 & $gcc.Source -std=c11 -Wall -Wextra -Werror `
+    "-I$($PSScriptRoot)\fixtures" `
     "-I$($root)\components\p300_stream\include" `
     "-I$($root)\components\eeg_acq\include" `
     "-I$($root)\components\app_config\include" `

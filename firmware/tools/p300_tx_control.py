@@ -215,6 +215,7 @@ class TxControlClient:
         retries: int = 2,
         events: queue.Queue | None = None,
         callback: Callable[[tuple[str, dict]], None] | None = None,
+        exchange=None,
     ) -> None:
         if (
             not device_host
@@ -229,6 +230,7 @@ class TxControlClient:
         self.retries = int(retries)
         self.events = events
         self.callback = callback
+        self.transport_exchange = exchange
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._socket: socket.socket | None = None
@@ -244,6 +246,11 @@ class TxControlClient:
             return self._thread is not None and self._thread.is_alive()
 
     def _exchange(self, packet: bytes, request_id: int) -> TxResultData:
+        if self.transport_exchange is not None:
+            try:
+                return parse_tx_control_result(self.transport_exchange(packet, self.timeout_s, self.retries, self._stop), request_id)
+            except TimeoutError as error:
+                raise TxTimeoutError(str(error)) from error
         destination = (socket.gethostbyname(self.device_host), self.port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("0.0.0.0", 0))

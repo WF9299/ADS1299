@@ -455,6 +455,7 @@ class ImpedanceClient:
         retries: int = 1,
         events: queue.Queue | None = None,
         callback: Callable[[tuple[str, dict]], None] | None = None,
+        exchange=None,
     ) -> None:
         if not device_host:
             raise ValueError("device_host is required")
@@ -468,6 +469,7 @@ class ImpedanceClient:
         self.retries = int(retries)
         self.events = events
         self.callback = callback
+        self.transport_exchange = exchange
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._socket: socket.socket | None = None
@@ -492,6 +494,11 @@ class ImpedanceClient:
     def measure(self, channel_mask: int = 0xFF, request_id: int | None = None) -> ImpedanceResultData:
         request_id = self.new_request_id() if request_id is None else int(request_id)
         packet = build_impedance_request(request_id, channel_mask)
+        if self.transport_exchange is not None:
+            try:
+                return parse_impedance_result(self.transport_exchange(packet, self.timeout_s, self.retries, self._stop), request_id)
+            except TimeoutError as error:
+                raise ImpedanceTimeoutError(str(error)) from error
         destination_ip = socket.gethostbyname(self.device_host)
         destination = (destination_ip, self.port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

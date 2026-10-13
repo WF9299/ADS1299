@@ -263,6 +263,8 @@ bool p300_clock_add_measurement(p300_clock_model_t *model,
                                 uint64_t t3_esp_us,
                                 uint64_t t4_pc_us);
 bool p300_clock_is_valid(const p300_clock_model_t *model);
+bool p300_clock_add_measurement_limits(p300_clock_model_t *model,
+    uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4, uint32_t max_rtt, uint32_t slack);
 uint64_t p300_clock_pc_to_esp(const p300_clock_model_t *model, uint64_t pc_us);
 bool p300_find_nearest_sample(const p300_sample_t *samples,
                               size_t sample_count,

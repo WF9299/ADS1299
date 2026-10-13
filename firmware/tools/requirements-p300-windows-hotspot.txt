@@ -1,0 +1,3 @@
+# Optional. USB/EEG/manual hotspot setup do not require these packages.
+winrt-Windows.Networking.Connectivity; sys_platform == "win32"
+winrt-Windows.Networking.NetworkOperators; sys_platform == "win32"

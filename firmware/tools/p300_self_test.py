@@ -277,6 +277,7 @@ class SelfTestClient:
         retries: int = 2,
         events: queue.Queue | None = None,
         callback: Callable[[tuple[str, dict]], None] | None = None,
+        exchange=None,
     ) -> None:
         if not device_host:
             raise ValueError("device_host is required")
@@ -288,6 +289,7 @@ class SelfTestClient:
         self.retries = int(retries)
         self.events = events
         self.callback = callback
+        self.transport_exchange = exchange
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._socket: socket.socket | None = None
@@ -305,6 +307,11 @@ class SelfTestClient:
     def switch(self, target_config_id: int, request_id: int | None = None) -> SelfTestResultData:
         request_id = self.new_request_id() if request_id is None else int(request_id)
         packet = build_self_test_request(request_id, target_config_id)
+        if self.transport_exchange is not None:
+            try:
+                return parse_self_test_result(self.transport_exchange(packet, self.timeout_s, self.retries, self._stop), request_id)
+            except TimeoutError as error:
+                raise SelfTestTimeoutError(str(error)) from error
         destination_ip = socket.gethostbyname(self.device_host)
         destination = (destination_ip, self.port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

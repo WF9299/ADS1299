@@ -7,6 +7,10 @@ import socket
 import struct
 import threading
 import time
+try:
+    from tools.p300_common import crc32c
+except ModuleNotFoundError:
+    from p300_common import crc32c
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -18,6 +22,11 @@ SYNC_REQ = 1
 SYNC_REPLY = 2
 MARKER = 3
 MARKER_ACK = 4
+TIME_ANCHOR = 14
+
+def build_time_anchor(sequence: int, unix_us: int, pc_us: int) -> bytes:
+    prefix = struct.pack(">2sBBIQQ", MAGIC, VERSION, TIME_ANCHOR, sequence & 0xffffffff, unix_us, pc_us)
+    return prefix + struct.pack(">I", crc32c(prefix))
 SYNC_RESULT = 5
 
 SYNC_REQ_STRUCT = struct.Struct(">2sBBIQ")
@@ -33,6 +42,7 @@ class MarkerStatus(IntEnum):
     EXPIRED = 2
     INVALID_CODE = 3
     QUEUE_FULL = 4
+    ACQUISITION_PAUSED = 5
 
 
 @dataclass(frozen=True)
@@ -82,10 +92,17 @@ def parse_marker_ack(packet: bytes) -> MarkerAck:
 class ClockSyncState:
     """PC-side mirror of the firmware RTT acceptance and adaptive-rate policy."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_rtt_us: int = 10_000, min_rtt_slack_us: int = 2_000) -> None:
         self._lock = threading.Lock()
         self._rtts: deque[int] = deque(maxlen=64)
         self._last_valid_s: float | None = None
+        self.max_rtt_us = max_rtt_us
+        self.min_rtt_slack_us = min_rtt_slack_us
+
+    def reset(self) -> None:
+        with self._lock:
+            self._rtts.clear()
+            self._last_valid_s = None
 
     def _expired(self, now_s: float) -> bool:
         return self._last_valid_s is not None and now_s - self._last_valid_s > 10.0
@@ -111,7 +128,7 @@ class ClockSyncState:
                 self._rtts.clear()
                 self._last_valid_s = None
             minimum = min(self._rtts) if self._rtts else None
-            if rtt > 10_000 or (minimum is not None and rtt > minimum + 2_000):
+            if rtt > self.max_rtt_us or (minimum is not None and rtt > minimum + self.min_rtt_slack_us):
                 return False
             self._rtts.append(rtt)
             self._last_valid_s = now_s
@@ -142,11 +159,17 @@ class P300MarkerClient:
         sync_timeout_s: float = 0.05,
         ack_timeout_s: float = 0.10,
         ack_retries: int = 3,
+        anchor_unix_time: bool = False,
+        exchange=None,
+        sync_ready=None,
     ) -> None:
         self.target = (host, port)
         self.sync_timeout_s = sync_timeout_s
         self.ack_timeout_s = ack_timeout_s
         self.ack_retries = ack_retries
+        self.anchor_unix_time = anchor_unix_time
+        self.transport_exchange = exchange
+        self.sync_ready = sync_ready
         self.sync_state = ClockSyncState()
         self._stop = threading.Event()
         self._sync_thread: threading.Thread | None = None
@@ -165,6 +188,8 @@ class P300MarkerClient:
         self.stop()
 
     def start(self) -> None:
+        if self.transport_exchange is not None:
+            return  # The single SerialSession owns synchronization and COM RX.
         if self._sync_thread and self._sync_thread.is_alive():
             return
         self._stop.clear()
@@ -181,6 +206,8 @@ class P300MarkerClient:
 
     @property
     def synchronized(self) -> bool:
+        if self.transport_exchange is not None:
+            return bool(self.sync_ready()) if self.sync_ready is not None else False
         return self.sync_state.synchronized()
 
     def wait_until_synchronized(self, timeout_s: float = 5.0) -> bool:
@@ -215,7 +242,9 @@ class P300MarkerClient:
                         if sequence != self._sequence or echoed_t1 != t1:
                             raise ValueError("stale SYNC_REPLY")
                         sync_socket.send(build_sync_result(sequence, t1, t2, t3, t4))
-                        self.sync_state.observe(t1, t2, t3, t4, time.monotonic())
+                        accepted = self.sync_state.observe(t1, t2, t3, t4, time.monotonic())
+                        if accepted and self.anchor_unix_time:
+                            sync_socket.send(build_time_anchor(sequence, time.time_ns()//1000, monotonic_us()))
                         self.last_sync_error = None
                     except (OSError, ValueError) as error:
                         if not self._stop.is_set():
@@ -245,6 +274,8 @@ class P300MarkerClient:
 
     def _exchange_marker(self, event_id: int, code: int, event_time: int) -> MarkerAck:
         packet = build_marker(event_id, code, event_time)
+        if self.transport_exchange is not None:
+            return parse_marker_ack(self.transport_exchange(packet, self.ack_timeout_s, self.ack_retries, self._stop))
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as marker_socket:
             marker_socket.connect(self.target)
             marker_socket.settimeout(self.ack_timeout_s)

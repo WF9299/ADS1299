@@ -7,7 +7,7 @@ if ($null -eq $python) {
 
 Push-Location $root
 try {
-    & $python.Source -m unittest discover -s tests -p 'test_p300_tools.py' -v
+    & $python.Source -m unittest discover -s tests -p 'test_p300*.py' -v
     if ($LASTEXITCODE -ne 0) {
         throw 'P300 PC tool tests failed.'
     }

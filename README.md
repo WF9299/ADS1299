@@ -1,6 +1,6 @@
 # ADS1299 ESP32-C5 TONG V1
 
-This repository contains the ESP32-C5-WROOM-1U-N8R8 port of the ADS1299 P300 acquisition firmware in `firmware/`, together with the Python PC monitor and diagnostic tools. It uses ESP-IDF 6.0.2, 8-channel acquisition at 1000 SPS, native Wi-Fi, TCP EEG streaming and UDP marker/control messages.
+This repository contains the ESP32-C5-WROOM-1U-N8R8 ADS1299 P300 firmware and Python PC tools. Version 2.1.0 uses ESP-IDF 6.0.2, 8ch/1000SPS, USB provisioning and selectable USB serial/native Wi-Fi transport. Monitor includes a Windows hotspot assistant for campus-network use.
 
 Start with `firmware/README.md` for build, network and first-power-on instructions. The approved port design is recorded in `docs/superpowers/specs/2026-09-24-esp32c5-port-design.md`.
 
@@ -8,7 +8,7 @@ Start with `firmware/README.md` for build, network and first-power-on instructio
 
 GitLab: [ads1299_esp32c5_tong_v1](http://10.201.1.182:1081/zhaoboyuan/ads1299_esp32c5_tong_v1).
 
-Open `firmware/` as the ESP-IDF project, not the outer repository directory. On a fresh clone, copy `firmware/components/app_config/include/app_config.example.h` to `app_config.h` in the same directory, then set the Wi-Fi SSID/password and the PC's current IP before building. The example's TCP IP is only a placeholder, not a detected server address.
+Open `firmware/` as the ESP-IDF project, not the outer directory. On a fresh clone, copy `firmware/components/app_config/include/app_config.example.h` to `app_config.h` for acquisition settings. Configure SSID/password and the actual PC endpoint through Monitor's **连接/配网** page over USB, not by editing/compiling credentials. Older local header network macros are no longer used.
 
 `app_config.h` remains local and is ignored by Git; do not force-add it. Keep shared non-secret configuration changes reflected in `app_config.example.h`. Build output, downloaded managed components, `sdkconfig`, editor configuration and acquisition exports are not committed. `sdkconfig.defaults` and `dependencies.lock` are retained for reproducible configuration.
 
@@ -16,7 +16,11 @@ Open `firmware/` as the ESP-IDF project, not the outer repository directory. On 
 
 As of 2026-10-10, the R8 board reports a stable ADS1299 ID of `0x3e`, passes the programmed register readback test, and produces DRDY near 1000 SPS. A cold joint at the ADS side of R25 was identified and repaired. Native Wi-Fi has obtained an IP address.
 
-The TCP target must follow the PC's address when changing hotspots. End-to-end Monitor reception, strictly loss-free acquisition and analog EEG quality still require their own validation; the successful register/DRDY checks alone do not prove them. Startup logs showed initial sample losses and some misaligned frames, with later windows reporting `OK`.
+The new transport uses runtime configuration/paired discovery rather than a fixed PC address. Software build and offline protocol/GUI tests pass; real-board high-speed serial, campus hotspot, switching and timing still need verification. Analog EEG quality and strictly loss-free acquisition are separate acceptance tasks; prior register/DRDY checks alone do not prove them.
+
+## Dual transport
+
+See [firmware usage](firmware/README.md) and the [approved USB/campus-hotspot design](docs/superpowers/specs/2026-10-11-usb-provisioning-dual-transport-design.md). PC authenticates to campus WLAN and shares an independent hotspot with the board; EEG stays on the hotspot/USB link while Monitor HTTP uses the campus uplink. Optional automatic hotspot management is capability-gated; system Settings/manual entry remains supported. No firewall disabling, routing changes or campus-authentication bypass is implemented.
 
 ## Sources
 
