@@ -318,14 +318,21 @@ static bool send_stream_config(void)
     const int length = snprintf(
         config, sizeof(config),
         "{\"type\":\"STREAM_CONFIG\",\"device_id\":\"P300_%02X%02X%02X%02X%02X%02X\","
-        "\"firmware_version\":\"P300_DUAL_V1\",\"stream_id\":%" PRIu32 ",\"config_id\":%u,"
+        "\"firmware_version\":\"2.2.0\",\"stream_id\":%" PRIu32 ",\"config_id\":%u,"
         "\"sample_rate_hz\":%u,\"channel_mask\":255,\"vref_v\":4.5,\"pga_gain\":12,"
-        "\"reference\":\"ADS1299 internal reference\",\"bias\":\"enabled\","
+        "\"reference\":\"ADS1299 internal reference\",\"bias\":\"%s\","
+        "\"bias_mask\":%u,\"bias_verified\":%s,\"bias_power_control\":true,"
         "\"marker_codes\":{\"0\":\"none\",\"1\":\"p300\"},\"sync\":\"pc_four_timestamp\","
         "\"tx_group_frames\":%u,\"tx_group_period_ms\":%u}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], s_stream_id,
         (unsigned)eeg_acq_get_config_id(),
         (unsigned)P300_SAMPLE_RATE_HZ,
+        !eeg_acq_normal_bias_is_verified() ? "unknown" :
+            (eeg_acq_get_config_id() == EEG_ACQ_CONFIG_NORMAL &&
+             eeg_acq_get_normal_bias_mask() != 0U ? "enabled" : "disabled"),
+        (unsigned)(eeg_acq_get_config_id() == EEG_ACQ_CONFIG_NORMAL ?
+                   eeg_acq_get_normal_bias_mask() : 0U),
+        eeg_acq_normal_bias_is_verified() ? "true" : "false",
         (unsigned)tx_group_frames,
         (unsigned)(P300_EEG_BATCH_SAMPLES * 1000U *
                    tx_group_frames / P300_SAMPLE_RATE_HZ));
@@ -506,7 +513,8 @@ static p300_bias_control_result_t bias_status_result(
         .status = status,
         .requested_mask = requested_mask,
         .actual_mask = verified ? eeg_acq_get_normal_bias_mask() : 0U,
-        .flags = verified ? P300_BIAS_FLAG_VERIFIED : 0U,
+        .flags = P300_BIAS_FLAG_POWER_CONTROL |
+                 (verified ? P300_BIAS_FLAG_VERIFIED : 0U),
         .stream_id = verified ? s_stream_id : 0U,
     };
     return result;
@@ -1120,12 +1128,20 @@ static void run_and_complete_bias_request(const active_bias_request_t *request)
                              verified, &result);
     if (status == P300_BIAS_STATUS_RESTORE_FAILED) {
         s_ads_fault = true;
-        s_fault_recovery_exhausted = false;
+        s_fault_recovery_exhausted = true;
     }
     portEXIT_CRITICAL(&s_mux);
 
     send_bias_result(&request->source, request->source_len, &result);
-    if (status == P300_BIAS_STATUS_RESTORE_FAILED) {
+    if (status == P300_BIAS_STATUS_OK || status == P300_BIAS_STATUS_APPLY_FAILED) {
+        /* TCP STREAM_CONFIG is connection-scoped; reconnect to publish the new
+         * verified BIAS state before any next segment. USB uses typed CONFIG. */
+        if (s_wifi_mode) {
+            close_tcp_socket();
+        } else {
+            s_serial_connected = false;
+        }
+    } else if (status == P300_BIAS_STATUS_RESTORE_FAILED) {
         close_tcp_socket();
     }
 }

@@ -405,9 +405,11 @@ p300_bias_parse_status_t p300_parse_bias_control_request(
     request->operation = (p300_bias_operation_t)packet[8];
     request->requested_mask = packet[9];
     const bool operation_valid = request->operation == P300_BIAS_OPERATION_QUERY ||
-                                 request->operation == P300_BIAS_OPERATION_SET;
+                                 request->operation == P300_BIAS_OPERATION_SET ||
+                                 request->operation == P300_BIAS_OPERATION_DISABLE;
     const bool mask_valid =
         (request->operation == P300_BIAS_OPERATION_QUERY && request->requested_mask == 0U) ||
+        (request->operation == P300_BIAS_OPERATION_DISABLE && request->requested_mask == 0U) ||
         (request->operation == P300_BIAS_OPERATION_SET && request->requested_mask != 0U &&
          (request->requested_mask & (uint8_t)~P300_ADS_CHANNEL_MASK) == 0U);
     if (request->request_id == 0U || !operation_valid || !mask_valid ||

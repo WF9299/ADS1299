@@ -402,6 +402,7 @@ esp_err_t eeg_acq_resume_ads1299_stream(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    s_normal_bias_verified = false;
     ESP_RETURN_ON_ERROR(apply_ads1299_capture_config(), TAG, "restore ADS1299 capture config");
     if (s_config_id == EEG_ACQ_CONFIG_NORMAL) {
         s_normal_bias_verified = true;
@@ -494,8 +495,7 @@ eeg_acq_mode_switch_status_t eeg_acq_set_config_id(uint8_t target_config_id)
 
 eeg_acq_bias_switch_status_t eeg_acq_set_normal_bias_mask(uint8_t target_mask)
 {
-    if (target_mask == 0U ||
-        (target_mask & (uint8_t)~P300_ADS_CHANNEL_MASK) != 0U) {
+    if ((target_mask & (uint8_t)~P300_ADS_CHANNEL_MASK) != 0U) {
         return EEG_ACQ_BIAS_SWITCH_INVALID_REQUEST;
     }
     if (!s_running || s_board == NULL || s_config_id != EEG_ACQ_CONFIG_NORMAL) {
@@ -513,8 +513,12 @@ eeg_acq_bias_switch_status_t eeg_acq_set_normal_bias_mask(uint8_t target_mask)
     }
     eeg_acq_clear_buffer();
 
+    s_normal_bias_verified = false;
     esp_err_t err = ads1299_set_bias_sensp_verified(target_mask);
     if (err == ESP_OK) {
+        s_normal_bias_mask = target_mask;
+        s_discard_samples = EEG_ACQ_MODE_SETTLE_SAMPLES;
+        eeg_acq_clear_buffer();
         err = resume_after_mode_config();
     }
     if (err == ESP_OK) {
@@ -529,6 +533,9 @@ eeg_acq_bias_switch_status_t eeg_acq_set_normal_bias_mask(uint8_t target_mask)
 
     ESP_LOGE(TAG, "ADS1299 BIAS mask apply failed; restoring mask=0x%02x: %s",
              previous_mask, esp_err_to_name(err));
+    /* Preserve the intended previous state even if rollback itself fails. */
+    s_normal_bias_mask = previous_mask;
+    s_discard_samples = EEG_ACQ_MODE_SETTLE_SAMPLES;
     ads1299_stop_continuous();
     if (ads1299_apply_verified_reference_config_with_bias(previous_mask) != ESP_OK ||
         resume_after_mode_config() != ESP_OK) {

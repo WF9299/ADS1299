@@ -34,6 +34,8 @@ esp_err_t ads1299_read_reg(uint8_t reg, uint8_t *value);
 esp_err_t ads1299_write_reg(uint8_t reg, uint8_t value);
 esp_err_t ads1299_apply_verified_reference_config(bool enable_all_channels);
 esp_err_t ads1299_apply_verified_reference_config_with_bias(uint8_t bias_mask);
+/* Normal BIAS state: nonzero enables the buffer with selected P inputs;
+ * zero powers down the buffer. Both CONFIG3 and sense registers are verified. */
 esp_err_t ads1299_set_bias_sensp_verified(uint8_t bias_mask);
 esp_err_t ads1299_apply_internal_test_config(void);
 esp_err_t ads1299_apply_internal_short_config(void);

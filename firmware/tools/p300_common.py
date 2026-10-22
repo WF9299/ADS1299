@@ -163,6 +163,7 @@ def batch_to_record(batch: EegBatch, config: dict | None = None) -> dict:
         "batch": True,
         "markers": [int(value) for value in batch.markers],
         "eeg_type": int(config.get("eeg_type", 1)),
+        **{key: config[key] for key in ("bias", "bias_mask", "bias_verified") if key in config},
     }
 
 

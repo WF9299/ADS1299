@@ -268,7 +268,7 @@ static esp_err_t ads1299_apply_verified_reference_config_impl(bool enable_all_ch
     }
 
     const uint8_t mask = enable_all_channels ? 0xFF : s_config.enabled_channel_mask;
-    if (bias_pos == 0U || (bias_pos & (uint8_t)~mask) != 0U) {
+    if ((bias_pos & (uint8_t)~mask) != 0U) {
         return ESP_ERR_INVALID_ARG;
     }
     /* Only enabled, electrode-connected P inputs may enter the BIAS loop.
@@ -279,7 +279,8 @@ static esp_err_t ads1299_apply_verified_reference_config_impl(bool enable_all_ch
      * and unused lead-off comparators disabled. Leaving CONFIG2 at 0xD5 makes
      * the 1.953125-Hz calibration generator toggle even with MUX=normal. */
     ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_CONFIG2, 0xC0), TAG, "write CONFIG2");
-    ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_CONFIG3, 0xEC), TAG, "write CONFIG3");
+    const uint8_t config3 = bias_pos != 0U ? 0xECU : 0xE8U;
+    ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_CONFIG3, config3), TAG, "write CONFIG3");
 
     for (uint8_t ch = 0; ch < 8; ++ch) {
         const uint8_t reg = (uint8_t)(ADS1299_REG_CH1SET + ch);
@@ -307,7 +308,7 @@ static esp_err_t ads1299_apply_verified_reference_config_impl(bool enable_all_ch
     ESP_LOGI(TAG, "ADS1299 SPI register readback test begin");
     ESP_RETURN_ON_ERROR(ads1299_check_reg(ADS1299_REG_CONFIG1, 0xD4), TAG, "check CONFIG1");
     ESP_RETURN_ON_ERROR(ads1299_check_reg(ADS1299_REG_CONFIG2, 0xC0), TAG, "check CONFIG2");
-    ESP_RETURN_ON_ERROR(ads1299_check_reg_masked(ADS1299_REG_CONFIG3, 0xEC, 0xFE), TAG, "check CONFIG3");
+    ESP_RETURN_ON_ERROR(ads1299_check_reg_masked(ADS1299_REG_CONFIG3, config3, 0xFE), TAG, "check CONFIG3");
     for (uint8_t ch = 0; ch < 8; ++ch) {
         const uint8_t reg = (uint8_t)(ADS1299_REG_CH1SET + ch);
         const bool enabled = (mask & (1U << ch)) != 0;
@@ -343,12 +344,24 @@ esp_err_t ads1299_set_bias_sensp_verified(uint8_t bias_mask)
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (bias_mask == 0U ||
-        (bias_mask & (uint8_t)~s_config.enabled_channel_mask) != 0U) {
+    if ((bias_mask & (uint8_t)~s_config.enabled_channel_mask) != 0U) {
         return ESP_ERR_INVALID_ARG;
     }
+    /* Called while acquisition is paused. Zero means power down the BIAS
+     * buffer, preserving the ADC reference and internal BIAS reference. */
+    const uint8_t config3 = bias_mask != 0U ? 0xECU : 0xE8U;
+    ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_CONFIG3, 0xE8),
+                        TAG, "power down BIAS before switching inputs");
+    ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_BIAS_SENSN, 0x00),
+                        TAG, "write runtime BIAS_SENSN");
     ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_BIAS_SENSP, bias_mask),
                         TAG, "write runtime BIAS_SENSP");
+    ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_CONFIG3, config3),
+                        TAG, "write runtime CONFIG3");
+    ESP_RETURN_ON_ERROR(ads1299_check_reg_masked(ADS1299_REG_CONFIG3, config3, 0xFE),
+                        TAG, "verify runtime CONFIG3");
+    ESP_RETURN_ON_ERROR(ads1299_check_reg(ADS1299_REG_BIAS_SENSN, 0x00),
+                        TAG, "verify runtime BIAS_SENSN");
     ESP_RETURN_ON_ERROR(ads1299_check_reg(ADS1299_REG_BIAS_SENSP, bias_mask),
                         TAG, "verify runtime BIAS_SENSP");
     ESP_LOGI(TAG, "ADS1299 runtime BIAS_SENSP verified: mask=0x%02x", bias_mask);

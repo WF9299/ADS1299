@@ -1,6 +1,6 @@
 # ADS1299 P300 acquisition on ESP32-C5-WROOM-1U-N8R8
 
-Independent ESP-IDF 6.0.2 firmware for the R8 board. Version 2.1.0 adds USB provisioning and selectable USB serial/native Wi-Fi transport for 8ch/1000SPS ADS1299 data. Wi-Fi uses TCP1234, control UDP1235 and paired discovery UDP1236. No ESP-Hosted/SDIO coprocessor is used.
+Independent ESP-IDF 6.0.2 firmware for the R8 board. Version 2.2.0 adds runtime BIAS power control to the USB provisioning and selectable USB serial/native Wi-Fi transport for 8ch/1000SPS ADS1299 data. Wi-Fi uses TCP1234, control UDP1235 and paired discovery UDP1236. No ESP-Hosted/SDIO coprocessor is used.
 
 ## Hardware mapping
 
@@ -118,3 +118,18 @@ The Record tab includes **SSVEP测试 — 127.0.0.1:25001** and
 the endpoint path is preserved (normally `/api/bci/data`). It does not start HTTP or
 overwrite the last saved destination. Start HTTP saves the current fields as before.
 Presets and destination fields are locked while HTTP is active; stop before switching.
+
+
+## Runtime BIAS power control (2.2.0)
+
+Flash the 2.2.0 firmware and restart Monitor. In **阻抗 → BIAS / 右腿驱动通道**, the **启用 BIAS** checkbox is a draft; click **应用到固件** and wait for the separate **设备实际 / VERIFIED** readback. Stop JSONL recording and HTTP pushing before applying. USB serial and Wi-Fi use the same request, retry and readback logic. Wi-Fi briefly reconnects after a change to publish fresh STREAM_CONFIG; USB publishes a fresh CONFIG frame. Then restart the desired record/push segment.
+
+When disabled, the normal EEG MUX, SRB1, ADC reference, PGA and sampling rate remain configured; CONFIG3 is 0xE8 and BIAS_SENSP/N are zero. When enabled, CONFIG3 is 0xEC and BIAS_SENSP uses the selected nonzero channel mask. All three registers are verified. Unchecking every channel does not replace the explicit power checkbox. Channel selections remain in the Monitor draft while BIAS is off.
+
+The setting is runtime only: reset/power-up starts with BIAS enabled. Impedance, internal-short exit, acquisition recovery and transport changes restore the current normal-mode BIAS state. On apply failure, the previous enabled or disabled state is restored and verified. If rollback fails, actual state becomes unknown and acquisition stays paused until device reboot. Automatic recovery is suppressed for this fault. Old firmware still permits nonzero channel selection, but the power checkbox remains unavailable and asks for a firmware update.
+
+Protocol v1 retains the 16-byte request / 20-byte result and CRC32C. QUERY=0 and nonzero SET=1 are unchanged; DISABLE=2 requires mask=0. Result flag POWER_CONTROL=0x08 advertises support; VERIFIED plus actual_mask=0 means confirmed off, while unverified mask=0 means unknown. Normal BIAS control replies describe the normal-mode state, including while an input diagnostic temporarily uses a different configuration. STREAM_CONFIG and raw JSONL/HTTP metadata include bias, bias_mask and bias_verified. EEG microvolt samples retain their original values.
+
+Register readback and host fault-injection tests verify software control and rollback; they do not verify the physical BIASOUT/electrode effect.
+
+Verified 2026-10-22: 92 Python tests (including production C function fault injection), host C protocol tests and ESP-IDF 6.0.2 build passed. App image: 1,050,880 bytes, SHA256 f2cb76802a279d75709eec7214ee9c352233447be229674bdc7723b83a81be4c. No device flash or physical BIASOUT test was performed.

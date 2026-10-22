@@ -13,7 +13,8 @@ static p300_bias_control_result_t make_result(
         .status = status,
         .requested_mask = request->requested_mask,
         .actual_mask = state->verified ? state->normal_mask : 0U,
-        .flags = state->verified ? P300_BIAS_FLAG_VERIFIED : 0U,
+        .flags = P300_BIAS_FLAG_POWER_CONTROL |
+                 (state->verified ? P300_BIAS_FLAG_VERIFIED : 0U),
         .stream_id = state->verified ? stream_id : 0U,
     };
     return result;
@@ -131,14 +132,14 @@ void p300_bias_state_complete(p300_bias_state_t *state,
         .status = status,
         .requested_mask = request.requested_mask,
         .actual_mask = verified ? actual_mask : 0U,
-        .flags = P300_BIAS_FLAG_CHANGED |
+        .flags = P300_BIAS_FLAG_CHANGED | P300_BIAS_FLAG_POWER_CONTROL |
                  (verified ? P300_BIAS_FLAG_VERIFIED : 0U),
         .stream_id = verified ? stream_id : 0U,
     };
     if (status == P300_BIAS_STATUS_RESTORE_FAILED) {
         result.actual_mask = 0U;
         result.stream_id = 0U;
-        result.flags = P300_BIAS_FLAG_CHANGED;
+        result.flags = P300_BIAS_FLAG_CHANGED | P300_BIAS_FLAG_POWER_CONTROL;
         verified = false;
         state->fault = true;
     }

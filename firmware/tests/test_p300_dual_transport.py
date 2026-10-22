@@ -40,6 +40,7 @@ class FakePort:
         self.stream_id = 1234
         self.config_id = 1
         self.tx_frames = 1
+        self.bias_mask = 255
         self.epoch_ready = False
         self.streaming = False
         self.commands = []
@@ -123,8 +124,10 @@ class FakePort:
                     status = 0 if self.config_id == 1 else 5
                     self.reply(CONTROL_REPLY, rid, struct.pack(">2sBBIB3xII", b"\xa5\x51", 1, 4, rid, status, self.seq, 100))
                 elif kind == 10:
-                    _, _, mask = parse_bias_control_request(packet)
-                    self.reply(CONTROL_REPLY, rid, build_bias_control_result(BiasResultData(rid, BiasStatus.OK, mask, mask or 255, BiasFlags.VERIFIED, self.stream_id)))
+                    _, operation, mask = parse_bias_control_request(packet)
+                    if operation != 0:
+                        self.bias_mask = mask
+                    self.reply(CONTROL_REPLY, rid, build_bias_control_result(BiasResultData(rid, BiasStatus.OK, mask, self.bias_mask, BiasFlags.VERIFIED | BiasFlags.POWER_CONTROL, self.stream_id)))
                 elif kind == 12:
                     _, _, frames = parse_tx_control_request(packet)
                     self.tx_frames = frames or self.tx_frames

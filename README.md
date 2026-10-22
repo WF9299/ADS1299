@@ -1,6 +1,6 @@
 # ADS1299 ESP32-C5 TONG V1
 
-This repository contains the ESP32-C5-WROOM-1U-N8R8 ADS1299 P300 firmware and Python PC tools. Version 2.1.0 uses ESP-IDF 6.0.2, 8ch/1000SPS, USB provisioning and selectable USB serial/native Wi-Fi transport. Monitor includes a Windows hotspot assistant for campus-network use.
+This repository contains the ESP32-C5-WROOM-1U-N8R8 ADS1299 P300 firmware and Python PC tools. Version 2.2.0 adds runtime BIAS power control and uses ESP-IDF 6.0.2, 8ch/1000SPS, USB provisioning and selectable USB serial/native Wi-Fi transport. Monitor includes a Windows hotspot assistant for campus-network use.
 
 Start with `firmware/README.md` for build, network and first-power-on instructions. The approved port design is recorded in `docs/superpowers/specs/2026-09-24-esp32c5-port-design.md`.
 

@@ -79,6 +79,13 @@ static cJSON *status(void)
     cJSON_AddStringToObject(out,"device_id",id);
     cJSON_AddStringToObject(out,"mode",p300_stream_wifi_mode()?"wifi":"serial");
     cJSON_AddBoolToObject(out,"ads_running",eeg_acq_is_running());
+    const bool bias_verified=eeg_acq_normal_bias_is_verified();
+    cJSON_AddBoolToObject(out,"bias_power_control",true);
+    cJSON_AddNumberToObject(out,"config_id",eeg_acq_get_config_id());
+    cJSON_AddBoolToObject(out,"bias_verified",bias_verified);
+    cJSON_AddNumberToObject(out,"bias_mask",bias_verified?eeg_acq_get_normal_bias_mask():0);
+    if (bias_verified) cJSON_AddBoolToObject(out,"bias_enabled",
+        eeg_acq_get_config_id()==EEG_ACQ_CONFIG_NORMAL && eeg_acq_get_normal_bias_mask()!=0);
     cJSON_AddBoolToObject(out,"wifi_available",s_wifi_ready);
     cJSON_AddBoolToObject(out,"wifi_connected",native_wifi_is_connected());
     cJSON_AddStringToObject(out,"ssid",cfg.ssid);

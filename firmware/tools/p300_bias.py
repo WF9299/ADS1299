@@ -32,6 +32,7 @@ _CRC = struct.Struct(">I")
 class BiasOperation(IntEnum):
     QUERY = 0
     SET = 1
+    DISABLE = 2
 
 
 class BiasStatus(IntEnum):
@@ -48,6 +49,7 @@ class BiasFlags(IntFlag):
     CHANGED = 1 << 0
     CACHED = 1 << 1
     VERIFIED = 1 << 2
+    POWER_CONTROL = 1 << 3
 
 
 class BiasProtocolError(ValueError):
@@ -75,6 +77,14 @@ class BiasResultData:
     def verified(self) -> bool:
         return bool(self.flags & BiasFlags.VERIFIED)
 
+    @property
+    def power_control_supported(self) -> bool:
+        return bool(self.flags & BiasFlags.POWER_CONTROL)
+
+    @property
+    def enabled(self) -> bool | None:
+        return self.actual_mask != 0 if self.verified else None
+
 
 @dataclass(frozen=True)
 class BiasSetOutcome:
@@ -89,6 +99,7 @@ class BiasSetOutcome:
             self.result.status == BiasStatus.OK
             and self.result.verified
             and self.result.actual_mask == self.target_mask
+            and (self.target_mask != 0 or self.result.power_control_supported)
         )
 
 
@@ -116,10 +127,10 @@ def build_bias_control_request(
     try:
         op = BiasOperation(operation)
     except ValueError as error:
-        raise ValueError("operation must be QUERY or SET") from error
-    mask = _mask(requested_mask, allow_zero=op == BiasOperation.QUERY)
-    if (op == BiasOperation.QUERY and mask != 0) or (op == BiasOperation.SET and mask == 0):
-        raise ValueError("QUERY requires mask 0; SET requires a non-zero mask")
+        raise ValueError("operation must be QUERY, SET or DISABLE") from error
+    mask = _mask(requested_mask, allow_zero=op != BiasOperation.SET)
+    if op != BiasOperation.SET and mask != 0:
+        raise ValueError("QUERY and DISABLE require mask 0; SET requires a non-zero mask")
     prefix = _REQUEST_PREFIX.pack(MAGIC, VERSION, BIAS_CONTROL_REQUEST, request, int(op), mask)
     return prefix + _CRC.pack(crc32c(prefix))
 
@@ -134,6 +145,8 @@ def parse_bias_control_request(packet: bytes) -> tuple[int, BiasOperation, int]:
     )
     if magic != MAGIC or version != VERSION or packet_type != BIAS_CONTROL_REQUEST:
         raise BiasProtocolError("invalid BIAS request magic, version, or type")
+    if packet[10:12] != b"\x00\x00":
+        raise BiasProtocolError("nonzero BIAS request reserved bytes")
     try:
         operation = BiasOperation(operation_value)
         build_bias_control_request(request_id, operation, requested_mask)
@@ -191,6 +204,8 @@ def parse_bias_control_result(
         result.actual_mask != 0 or result.stream_id != 0 or result.verified
     ):
         raise BiasProtocolError("RESTORE_FAILED result claims a verified register state")
+    if result.verified and result.actual_mask == 0 and not result.power_control_supported:
+        raise BiasProtocolError("verified BIAS off requires power-control capability")
     return result
 
 
@@ -305,10 +320,17 @@ class BiasControlClient:
 
     def set_mask(self, target_mask: int, request_id: int | None = None) -> BiasSetOutcome:
         target = _mask(target_mask, allow_zero=False)
+        return self._set_target(target, BiasOperation.SET, request_id)
+
+    def disable(self, request_id: int | None = None) -> BiasSetOutcome:
+        return self._set_target(0, BiasOperation.DISABLE, request_id)
+
+    def _set_target(self, target: int, operation: BiasOperation,
+                    request_id: int | None) -> BiasSetOutcome:
         request_id = self.new_request_id() if request_id is None else _request_id(request_id)
         try:
             result = self._exchange(
-                build_bias_control_request(request_id, BiasOperation.SET, target), request_id
+                build_bias_control_request(request_id, operation, target), request_id
             )
             return BiasSetOutcome(result, target, request_id, False)
         except BiasTimeoutError:
@@ -331,6 +353,10 @@ class BiasControlClient:
         request_id = self.new_request_id() if request_id is None else _request_id(request_id)
         return self._start_worker("set", request_id, target)
 
+    def start_disable(self, request_id: int | None = None) -> int:
+        request_id = self.new_request_id() if request_id is None else _request_id(request_id)
+        return self._start_worker("disable", request_id, 0)
+
     def _start_worker(self, operation: str, request_id: int, target_mask: int) -> int:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -348,9 +374,12 @@ class BiasControlClient:
     def _run(self, operation: str, request_id: int, target_mask: int) -> None:
         self._emit("started", request_id, operation=operation, target_mask=target_mask)
         try:
-            result: object = self.query(request_id) if operation == "query" else self.set_mask(
-                target_mask, request_id
-            )
+            if operation == "query":
+                result: object = self.query(request_id)
+            elif operation == "disable":
+                result = self.disable(request_id)
+            else:
+                result = self.set_mask(target_mask, request_id)
         except BiasCancelledError as error:
             self._emit(
                 "cancelled", request_id, operation=operation,

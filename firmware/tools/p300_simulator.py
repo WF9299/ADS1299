@@ -115,8 +115,8 @@ class SignalGenerator:
 
     def set_bias_mask(self, bias_mask: int) -> bool:
         value = int(bias_mask)
-        if not 1 <= value <= 0xFF:
-            raise ValueError("bias_mask must be a non-zero uint8")
+        if not 0 <= value <= 0xFF:
+            raise ValueError("bias_mask must fit uint8 (zero powers BIAS down)")
         with self._lock:
             if self.bias_mask == value:
                 return False
@@ -260,11 +260,11 @@ class SelfTestControlServer(threading.Thread):
             if operation == BiasOperation.QUERY:
                 result = BiasResultData(
                     request_id, BiasStatus.OK, 0, self.generator.bias_mask,
-                    BiasFlags.VERIFIED, self.generator.stream_id,
+                    BiasFlags.VERIFIED | BiasFlags.POWER_CONTROL, self.generator.stream_id,
                 )
             elif self.bias_set_status == BiasStatus.OK:
                 changed = self.generator.set_bias_mask(requested_mask)
-                flags = BiasFlags.VERIFIED | (BiasFlags.CHANGED if changed else BiasFlags(0))
+                flags = BiasFlags.POWER_CONTROL | BiasFlags.VERIFIED | (BiasFlags.CHANGED if changed else BiasFlags(0))
                 result = BiasResultData(
                     request_id, BiasStatus.OK, requested_mask,
                     self.generator.bias_mask, flags, self.generator.stream_id,
@@ -272,7 +272,7 @@ class SelfTestControlServer(threading.Thread):
             elif self.bias_set_status == BiasStatus.RESTORE_FAILED:
                 result = BiasResultData(
                     request_id, BiasStatus.RESTORE_FAILED, requested_mask, 0,
-                    BiasFlags(0), 0,
+                    BiasFlags.POWER_CONTROL, 0,
                 )
             else:
                 flags = (
@@ -282,7 +282,7 @@ class SelfTestControlServer(threading.Thread):
                 )
                 result = BiasResultData(
                     request_id, self.bias_set_status, requested_mask,
-                    self.generator.bias_mask, flags, self.generator.stream_id,
+                    self.generator.bias_mask, flags | BiasFlags.POWER_CONTROL, self.generator.stream_id,
                 )
             self._bias_cache[request_id] = result
         if cached:

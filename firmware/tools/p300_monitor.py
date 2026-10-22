@@ -427,6 +427,7 @@ if QtWidgets is not None:
             self.self_test_client: SelfTestClient | None = None
             self.bias_client: BiasControlClient | None = None
             self.bias_actual_mask: int | None = None
+            self.bias_power_supported: bool | None = None
             self.bias_draft_mask = 0xFF
             self.bias_pending = False
             self.bias_last_request_id: int | None = None
@@ -782,13 +783,18 @@ if QtWidgets is not None:
 
             bias_group = QtWidgets.QGroupBox("BIAS / 右腿驱动通道")
             bias_layout = QtWidgets.QGridLayout(bias_group)
+            self.bias_enabled_checkbox = QtWidgets.QCheckBox("启用 BIAS（待应用；重启设备默认开启）")
+            self.bias_enabled_checkbox.setChecked(True)
+            self.bias_enabled_checkbox.setEnabled(False)
+            self.bias_enabled_checkbox.toggled.connect(self._bias_draft_changed)
+            bias_layout.addWidget(self.bias_enabled_checkbox, 0, 0, 1, 4)
             self.bias_checkboxes: list[QtWidgets.QCheckBox] = []
             for channel in range(CHANNELS):
                 checkbox = QtWidgets.QCheckBox(f"CH{channel + 1}")
                 checkbox.setChecked(True)
                 checkbox.toggled.connect(self._bias_draft_changed)
                 self.bias_checkboxes.append(checkbox)
-                bias_layout.addWidget(checkbox, channel // 4, channel % 4)
+                bias_layout.addWidget(checkbox, 1 + channel // 4, channel % 4)
             self.bias_query_button = QtWidgets.QPushButton("查询当前")
             self.bias_query_button.clicked.connect(self._query_bias_mask)
             self.bias_recommend_button = QtWidgets.QPushButton("采用阻抗推荐")
@@ -797,10 +803,10 @@ if QtWidgets is not None:
             self.bias_all_button.clicked.connect(self._select_all_bias_channels)
             self.bias_apply_button = QtWidgets.QPushButton("应用到固件")
             self.bias_apply_button.clicked.connect(self._apply_bias_mask)
-            bias_layout.addWidget(self.bias_query_button, 2, 0, 1, 2)
-            bias_layout.addWidget(self.bias_recommend_button, 2, 2, 1, 2)
-            bias_layout.addWidget(self.bias_all_button, 3, 0, 1, 2)
-            bias_layout.addWidget(self.bias_apply_button, 3, 2, 1, 2)
+            bias_layout.addWidget(self.bias_query_button, 3, 0, 1, 2)
+            bias_layout.addWidget(self.bias_recommend_button, 3, 2, 1, 2)
+            bias_layout.addWidget(self.bias_all_button, 4, 0, 1, 2)
+            bias_layout.addWidget(self.bias_apply_button, 4, 2, 1, 2)
             self.bias_status = QtWidgets.QLabel("等待连接后自动查询固件实际掩码")
             self.bias_status.setWordWrap(True)
             self.bias_actual_label = QtWidgets.QLabel("设备实际：未知")
@@ -809,9 +815,9 @@ if QtWidgets is not None:
                 "待应用 0xFF：CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8"
             )
             self.bias_draft_label.setWordWrap(True)
-            bias_layout.addWidget(self.bias_actual_label, 4, 0, 1, 4)
-            bias_layout.addWidget(self.bias_draft_label, 5, 0, 1, 4)
-            bias_layout.addWidget(self.bias_status, 6, 0, 1, 4)
+            bias_layout.addWidget(self.bias_actual_label, 5, 0, 1, 4)
+            bias_layout.addWidget(self.bias_draft_label, 6, 0, 1, 4)
+            bias_layout.addWidget(self.bias_status, 7, 0, 1, 4)
             layout.addWidget(bias_group)
             self._update_bias_controls()
             return tab
@@ -1087,6 +1093,9 @@ if QtWidgets is not None:
                 if "vref_v" in self.model.config and "pga_gain" in self.model.config:
                     payload["vref_v"] = self.model.config["vref_v"]
                     payload["pga_gain"] = self.model.config["pga_gain"]
+                for key in ("bias", "bias_mask", "bias_verified"):
+                    if key in record:
+                        payload[key] = record[key]
                 self.http_sender.submit(payload)
 
         def _update_http_controls(self) -> None:
@@ -1292,6 +1301,7 @@ if QtWidgets is not None:
             self.quality_analyzer.reset("disconnect")
             self.display_quality_analyzer.reset("disconnect")
             self.bias_actual_mask = None
+            self.bias_power_supported = None
             self.bias_pending = False
             self.bias_last_request_id = None
             self.bias_actual_label.setText("设备实际：未知")
@@ -1598,15 +1608,17 @@ if QtWidgets is not None:
 
         def _bias_draft_changed(self) -> None:
             self.bias_draft_mask = self._bias_checkbox_mask()
+            enabled = self.bias_enabled_checkbox.isChecked()
             self.bias_draft_label.setText(
-                f"待应用 0x{self.bias_draft_mask:02X}："
-                f"{self._format_channel_mask(self.bias_draft_mask)}"
+                (f"待应用 0x{self.bias_draft_mask:02X}：开启，"
+                 f"{self._format_channel_mask(self.bias_draft_mask)}") if enabled else
+                "待应用：关闭 BIAS 放大器（保留通道选择；点击应用后生效）"
             )
-            if self.bias_draft_mask == 0:
+            if enabled and self.bias_draft_mask == 0:
                 self.bias_status.setText("BIAS至少需要选择1个通道，当前草稿不能应用")
                 self.bias_status.setStyleSheet("color:#ff6b6b")
             elif self.bias_actual_mask is not None:
-                same = self.bias_draft_mask == self.bias_actual_mask
+                same = (self.bias_draft_mask if enabled else 0) == self.bias_actual_mask
                 self.bias_draft_label.setStyleSheet("" if same else "color:#d9a441")
             self._update_bias_controls()
 
@@ -1645,10 +1657,14 @@ if QtWidgets is not None:
             self._update_bias_controls()
 
         def _apply_bias_mask(self) -> None:
-            target = self._bias_checkbox_mask()
-            if target == 0 or not self.bias_apply_button.isEnabled():
+            enabled = self.bias_enabled_checkbox.isChecked()
+            target = self._bias_checkbox_mask() if enabled else 0
+            if (enabled and target == 0) or not self.bias_apply_button.isEnabled():
                 return
-            if target.bit_count() <= 2:
+            if not enabled and self.bias_power_supported is not True:
+                self.bias_status.setText("BIAS开关需要升级设备固件；当前仅支持通道选择")
+                return
+            if enabled and target.bit_count() <= 2:
                 answer = QtWidgets.QMessageBox.question(
                     self,
                     "确认低通道数BIAS",
@@ -1660,7 +1676,8 @@ if QtWidgets is not None:
                 if answer != QtWidgets.QMessageBox.Yes:
                     return
             try:
-                request_id = self._ensure_bias_client().start_set(target)
+                client = self._ensure_bias_client()
+                request_id = client.start_set(target) if enabled else client.start_disable()
             except (OSError, ValueError, RuntimeError) as error:
                 self.bias_status.setText(f"BIAS设置启动失败：{error}")
                 self.bias_status.setStyleSheet("color:#ff6b6b")
@@ -1672,6 +1689,12 @@ if QtWidgets is not None:
             )
             self.bias_status.setStyleSheet("color:#247ba0")
             self._update_bias_controls()
+
+        def _set_bias_draft_enabled(self, enabled: bool) -> None:
+            self.bias_enabled_checkbox.blockSignals(True)
+            self.bias_enabled_checkbox.setChecked(enabled)
+            self.bias_enabled_checkbox.blockSignals(False)
+            self._bias_draft_changed()
 
         def _handle_bias_event(self, event: dict) -> None:
             state = str(event.get("state", "error"))
@@ -1709,16 +1732,22 @@ if QtWidgets is not None:
                 f"，SET超时后已用QUERY 0x{result.request_id:08X}核对"
                 if outcome is not None and outcome.reconciled else ""
             )
-            if result.verified and result.actual_mask:
+            self.bias_power_supported = result.power_control_supported
+            if result.verified:
                 self.bias_actual_mask = result.actual_mask
                 self.bias_actual_label.setText(
-                    f"设备实际 0x{result.actual_mask:02X}："
+                    f"设备实际 0x{result.actual_mask:02X}：{'开启' if result.actual_mask else '关闭 BIAS 放大器'}，"
                     f"{self._format_channel_mask(result.actual_mask)}（VERIFIED）"
                 )
                 self.bias_actual_label.setStyleSheet("color:#287a4d")
+            else:
+                self.bias_actual_mask = None
+                self.bias_actual_label.setText("设备实际：未知（未回读确认）")
             if result.status == BiasStatus.OK and result.verified:
                 if outcome is None or outcome.applied:
-                    self._set_bias_checkbox_mask(result.actual_mask)
+                    if result.actual_mask:
+                        self._set_bias_checkbox_mask(result.actual_mask)
+                    self._set_bias_draft_enabled(result.actual_mask != 0)
                 if outcome is not None and not outcome.applied:
                     message = (
                         f"SET未确认：目标0x{outcome.target_mask:02X}，固件实际0x{result.actual_mask:02X}"
@@ -1726,7 +1755,7 @@ if QtWidgets is not None:
                     color = "#ff6b6b"
                 else:
                     message = (
-                        f"固件确认 0x{result.actual_mask:02X}："
+                        f"固件确认{'开启' if result.actual_mask else '关闭'} 0x{result.actual_mask:02X}："
                         f"{self._format_channel_mask(result.actual_mask)}"
                     )
                     color = "#287a4d"
@@ -1741,6 +1770,8 @@ if QtWidgets is not None:
                 else:
                     message = f"固件返回 {result.status.name}，未产生新的已验证掩码"
                 color = "#ff6b6b" if result.status != BiasStatus.BUSY else "#d9a441"
+            if not self.bias_power_supported:
+                message += "；仅支持通道选择，BIAS开关需升级固件"
             self.bias_status.setText(
                 f"请求 0x{request_id:08X}：{message}{reconciled}；"
                 f"stream=0x{result.stream_id:08X}，flags={','.join(flag_names) or '0'}"
@@ -1762,15 +1793,19 @@ if QtWidgets is not None:
             )
             set_unlocked = (
                 safe and self.has_valid_eeg and self.bias_actual_mask is not None
-                and self.bias_draft_mask != 0
+                and ((self.bias_enabled_checkbox.isChecked() and self.bias_draft_mask != 0)
+                     or (not self.bias_enabled_checkbox.isChecked() and self.bias_power_supported is True))
                 and self.writer is None and self.http_sender is None
             )
+            self.bias_enabled_checkbox.setEnabled(safe and self.bias_power_supported is True)
             self.bias_query_button.setEnabled(safe)
             self.bias_apply_button.setEnabled(set_unlocked)
             self.bias_all_button.setEnabled(not self.bias_pending)
             self.bias_recommend_button.setEnabled(
                 not self.bias_pending and self.last_impedance_result is not None
             )
+            for checkbox in self.bias_checkboxes:
+                checkbox.setEnabled(not self.bias_pending and self.bias_enabled_checkbox.isChecked())
 
         def _refresh_quality_metrics(self) -> None:
             snapshot = self.quality_analyzer.snapshot()
@@ -1911,6 +1946,7 @@ if QtWidgets is not None:
                         self.quality_analyzer.reset("disconnect")
                         self.display_quality_analyzer.reset("disconnect")
                         self.bias_actual_mask = None
+                        self.bias_power_supported = None
                         self.bias_pending = False
                         self.bias_last_request_id = None
                         self.bias_actual_label.setText("设备实际：未知")
@@ -1929,6 +1965,8 @@ if QtWidgets is not None:
                     if self.connected:
                         self._query_bias_mask()
                 elif kind == "config":
+                    for key in ("bias", "bias_mask", "bias_verified", "bias_power_control"):
+                        self.model.config.pop(key, None)
                     self.model.set_config(event[1])
                     self._set_tx_provisional_from_config()
                     device = event[1].get("device", event[1].get("device_id", "ESP32-C5-ADS1299"))

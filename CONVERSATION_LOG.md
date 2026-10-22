@@ -443,3 +443,17 @@ firmware/tools/p300_http_push.py、tools/p300_monitor.py、tests/test_p300_http_
 
 **Codex**:
 正在保存BIAS修改前的现有固件及Monitor基线，包含此前配网恢复、显示滤波与HTTP预设；排除构建产物和本机HTTP设置，未执行push。核对现有USB CONTROL与Wi-Fi UDP可共用BIAS命令，计划独立启停、回读和失败回退；尚未改BIAS产品实现。跨项目工作记录位于D:/Project/260720SSVEP_DISPLAY_JD。
+
+**基线提交与设计**:
+当前C5快照已提交429c50c（codex/usb-provisioning-dual-transport），配套SSVEP快照ebf6741（main）；未push。Python83项通过30.051秒，主机C协议测试通过；配套SSVEP51项通过30.615秒。BIAS具体规格在D:/Project/260720SSVEP_DISPLAY_JD/docs/superpowers/specs/2026-10-22-c5-bias-power-control-design.md，文档提交20d9709。已请求用户确认运行时独立启停、重启默认开启及既有记录/HTTP互锁，当前未改BIAS产品代码。
+
+
+### 第35轮
+
+**用户**:
+明确确认按2026-10-22 BIAS启停设计实施。
+
+**Codex**:
+完成固件2.2.0与Monitor独立BIAS启停，USB/Wi-Fi复用现有控制；关闭CONFIG3=0xE8且BIAS_SENSP/N=0，正常EEG输入/参考/PGA不变，三个寄存器回读。DISABLE操作及POWER_CONTROL能力位区分旧固件，零有效掩码VERIFIED为关闭、未验证为未知；关闭保留GUI通道草稿，重启设备默认开启，不写NVS。暂停切换、稳定样本隔离、失败恢复原开启/关闭状态，回滚失败保持暂停且禁用该故障的自动恢复。恢复路径保留当前正常BIAS掩码。Wi-Fi切换后短重连刷新STREAM_CONFIG，USB发布新CONFIG，原始JSONL/HTTP包含BIAS元信息且EEG值不变。
+
+完整92项Python测试通过13.205秒，包含9项新增协议/USB/UDP/GUI/生产C函数故障注入，扩展主机C协议测试通过，ESP-IDF6.0.2编译成功。应用1050880字节，SHA256 f2cb76802a279d75709eec7214ee9c352233447be229674bdc7723b83a81be4c。逐文件哈希核对应用20个实现/测试/说明文件，静态开启/关闭/旧固件界面已检查。实板未烧录，模拟电气效果未验证。烧录包位于配套项目outputs/ssvep_realtime/bias-power-2.2.0/c5-ads1299-2.2.0-bias.zip；使用时烧录新固件并重启Monitor，先停止记录/HTTP，在阻抗页取消启用BIAS、应用并等待关闭VERIFIED；重新勾选可恢复。

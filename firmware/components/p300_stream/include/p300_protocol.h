@@ -94,6 +94,7 @@ typedef enum {
 typedef enum {
     P300_BIAS_OPERATION_QUERY = 0,
     P300_BIAS_OPERATION_SET = 1,
+    P300_BIAS_OPERATION_DISABLE = 2,
 } p300_bias_operation_t;
 
 typedef enum {
@@ -148,6 +149,7 @@ enum {
     P300_BIAS_FLAG_CHANGED = 1U << 0,
     P300_BIAS_FLAG_CACHED = 1U << 1,
     P300_BIAS_FLAG_VERIFIED = 1U << 2,
+    P300_BIAS_FLAG_POWER_CONTROL = 1U << 3,
 };
 
 enum {

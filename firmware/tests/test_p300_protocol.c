@@ -300,6 +300,12 @@ static void test_bias_control_request_and_result_wire_packets(void)
     put_u32_be(&request[12], p300_crc32c(request, 12));
     assert(p300_parse_bias_control_request(request, sizeof(request), &parsed) ==
            P300_BIAS_PARSE_INVALID);
+    request[8] = P300_BIAS_OPERATION_DISABLE;
+    put_u32_be(&request[12], p300_crc32c(request, 12));
+    assert(p300_parse_bias_control_request(request, sizeof(request), &parsed) ==
+           P300_BIAS_PARSE_OK);
+    assert(parsed.operation == P300_BIAS_OPERATION_DISABLE && parsed.requested_mask == 0U);
+    request[8] = P300_BIAS_OPERATION_SET;
     request[9] = 0x35U;
     request[10] = 1U;
     put_u32_be(&request[12], p300_crc32c(request, 12));
@@ -356,7 +362,7 @@ static void test_bias_runtime_query_set_idempotency_and_failure(void)
     assert(p300_bias_state_handle(&state, &query, true, false, 100U,
                                   &reply, &cached) == P300_BIAS_ACTION_REPLY);
     assert(reply.status == P300_BIAS_STATUS_OK && reply.actual_mask == 0xFFU);
-    assert(reply.flags == P300_BIAS_FLAG_VERIFIED && !cached);
+    assert(reply.flags == (P300_BIAS_FLAG_VERIFIED | P300_BIAS_FLAG_POWER_CONTROL) && !cached);
 
     const p300_bias_control_request_t same = {
         .request_id = 2U,
@@ -393,7 +399,7 @@ static void test_bias_runtime_query_set_idempotency_and_failure(void)
                              &reply);
     assert(reply.status == P300_BIAS_STATUS_OK && reply.actual_mask == 0x35U);
     assert(reply.stream_id == 101U);
-    assert(reply.flags == (P300_BIAS_FLAG_CHANGED | P300_BIAS_FLAG_VERIFIED));
+    assert(reply.flags == (P300_BIAS_FLAG_CHANGED | P300_BIAS_FLAG_VERIFIED | P300_BIAS_FLAG_POWER_CONTROL));
     assert(p300_bias_state_handle(&state, &change, true, false, 101U,
                                   &reply, &cached) == P300_BIAS_ACTION_REPLY);
     assert(cached && (reply.flags & P300_BIAS_FLAG_CACHED) != 0U);
@@ -422,7 +428,7 @@ static void test_bias_runtime_query_set_idempotency_and_failure(void)
     p300_bias_state_complete(&state, P300_BIAS_STATUS_RESTORE_FAILED,
                              0U, 0U, false, &reply);
     assert(reply.actual_mask == 0U && reply.stream_id == 0U);
-    assert(reply.flags == P300_BIAS_FLAG_CHANGED && state.fault);
+    assert(reply.flags == (P300_BIAS_FLAG_CHANGED | P300_BIAS_FLAG_POWER_CONTROL) && state.fault);
 
     const p300_bias_control_request_t unauthorized = {
         .request_id = 7U,
@@ -432,6 +438,51 @@ static void test_bias_runtime_query_set_idempotency_and_failure(void)
     assert(p300_bias_state_handle(&state, &unauthorized, false, false, 0U,
                                   &reply, &cached) == P300_BIAS_ACTION_REPLY);
     assert(reply.status == P300_BIAS_STATUS_NO_TCP_STREAM);
+}
+
+static void test_bias_power_off_restore_and_cache(void)
+{
+    p300_bias_state_t state;
+    p300_bias_control_result_t reply;
+    p300_bias_control_request_t taken;
+    bool cached;
+    p300_bias_state_init(&state, 0x35U, true);
+    p300_bias_control_request_t request = {20U, P300_BIAS_OPERATION_DISABLE, 0U};
+    assert(p300_bias_state_handle(&state, &request, true, false, 200U, &reply, &cached)
+           == P300_BIAS_ACTION_QUEUED);
+    assert(p300_bias_state_take_pending(&state, &taken));
+    p300_bias_state_complete(&state, P300_BIAS_STATUS_OK, 0U, 201U, true, &reply);
+    assert(reply.actual_mask == 0U && reply.stream_id == 201U);
+    assert((reply.flags & (P300_BIAS_FLAG_VERIFIED | P300_BIAS_FLAG_POWER_CONTROL))
+           == (P300_BIAS_FLAG_VERIFIED | P300_BIAS_FLAG_POWER_CONTROL));
+    assert(p300_bias_state_handle(&state, &request, true, false, 201U, &reply, &cached)
+           == P300_BIAS_ACTION_REPLY);
+    assert(cached && reply.actual_mask == 0U);
+    request.request_id++;
+    request.operation = P300_BIAS_OPERATION_QUERY;
+    assert(p300_bias_state_handle(&state, &request, true, false, 201U, &reply, &cached)
+           == P300_BIAS_ACTION_REPLY);
+    assert(reply.status == P300_BIAS_STATUS_OK && reply.actual_mask == 0U);
+    assert(reply.flags & P300_BIAS_FLAG_VERIFIED);
+    request.request_id++;
+    request.operation = P300_BIAS_OPERATION_DISABLE;
+    assert(p300_bias_state_handle(&state, &request, true, false, 201U, &reply, &cached)
+           == P300_BIAS_ACTION_REPLY);
+    assert(!(reply.flags & P300_BIAS_FLAG_CHANGED));
+    request.request_id++;
+    request.operation = P300_BIAS_OPERATION_SET;
+    request.requested_mask = 0x35U;
+    assert(p300_bias_state_handle(&state, &request, true, false, 201U, &reply, &cached)
+           == P300_BIAS_ACTION_QUEUED);
+    assert(p300_bias_state_take_pending(&state, &taken));
+    p300_bias_state_complete(&state, P300_BIAS_STATUS_APPLY_FAILED, 0U, 202U, true, &reply);
+    assert(state.normal_mask == 0U && reply.actual_mask == 0U && state.verified);
+    request.request_id++;
+    assert(p300_bias_state_handle(&state, &request, true, false, 202U, &reply, &cached)
+           == P300_BIAS_ACTION_QUEUED);
+    assert(p300_bias_state_take_pending(&state, &taken));
+    p300_bias_state_complete(&state, P300_BIAS_STATUS_OK, 0x35U, 203U, true, &reply);
+    assert(state.normal_mask == 0x35U && state.verified);
 }
 
 static int32_t volts_to_code(double volts)
@@ -719,6 +770,7 @@ int main(void)
     test_self_test_mode_request_and_result_wire_packets();
     test_bias_control_request_and_result_wire_packets();
     test_bias_runtime_query_set_idempotency_and_failure();
+    test_bias_power_off_restore_and_cache();
     test_impedance_synchronous_demodulation();
     test_drdy_health_classification();
     test_tcp_tx_group_coalesces_two_complete_contiguous_frames();
