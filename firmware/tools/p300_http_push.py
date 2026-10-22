@@ -26,6 +26,12 @@ HTTP_QUEUE_PACKETS = 10
 DEFAULT_HTTP_SERVER_IP = "10.201.1.182"
 DEFAULT_HTTP_SERVER_PORT = 25000
 DEFAULT_HTTP_ENDPOINT = "/api/bci/data"
+# Presets fill address/port only; custom paths and persisted settings remain intact.
+HTTP_PUSH_PRESETS = (
+    ("SSVEP测试", "127.0.0.1", 25001),
+    ("SEU电视端", "10.201.1.182", 25000),
+)
+
 
 
 @dataclass(frozen=True)

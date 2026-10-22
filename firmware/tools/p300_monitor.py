@@ -35,6 +35,7 @@ from tools.p300_impedance import (
     build_impedance_report,
 )
 from tools.p300_http_push import (
+    HTTP_PUSH_PRESETS,
     HttpJsonSender,
     HttpPacketAggregator,
     HttpPushSettings,
@@ -873,6 +874,16 @@ if QtWidgets is not None:
             self.http_port_edit.setRange(1, 65535)
             self.http_port_edit.setValue(self.http_settings.port)
             self.http_endpoint_edit = QtWidgets.QLineEdit(self.http_settings.endpoint)
+            self.http_preset_combo = QtWidgets.QComboBox()
+            for label, ip, port in HTTP_PUSH_PRESETS:
+                self.http_preset_combo.addItem(f"{label} — {ip}:{port}", (ip, port))
+            self.http_preset_combo.addItem("自定义", None)
+            self.http_preset_combo.setToolTip("选择预设仅填服务器IP和端口；路径保留。推送中不可切换，请先停止HTTP。")
+            self.http_preset_combo.currentIndexChanged.connect(self._apply_http_preset)
+            self.http_ip_edit.textChanged.connect(self._sync_http_preset)
+            self.http_port_edit.valueChanged.connect(self._sync_http_preset)
+            self._sync_http_preset()
+
             self.http_button = QtWidgets.QPushButton("开始 HTTP 推送")
             self.http_button.clicked.connect(self._toggle_http_push)
             self.http_status = QtWidgets.QLabel("HTTP：关闭")
@@ -881,16 +892,18 @@ if QtWidgets is not None:
             self.http_stats.setWordWrap(True)
             self.http_detail = QtWidgets.QLabel("最近响应：--")
             self.http_detail.setWordWrap(True)
-            http_layout.addWidget(QtWidgets.QLabel("服务器 IP"), 0, 0)
-            http_layout.addWidget(self.http_ip_edit, 0, 1)
-            http_layout.addWidget(QtWidgets.QLabel("端口"), 0, 2)
-            http_layout.addWidget(self.http_port_edit, 0, 3)
-            http_layout.addWidget(QtWidgets.QLabel("路径"), 1, 0)
-            http_layout.addWidget(self.http_endpoint_edit, 1, 1, 1, 3)
-            http_layout.addWidget(self.http_button, 2, 0, 1, 4)
-            http_layout.addWidget(self.http_status, 3, 0, 1, 4)
-            http_layout.addWidget(self.http_stats, 4, 0, 1, 4)
-            http_layout.addWidget(self.http_detail, 5, 0, 1, 4)
+            http_layout.addWidget(QtWidgets.QLabel("目的地预设"), 0, 0)
+            http_layout.addWidget(self.http_preset_combo, 0, 1, 1, 3)
+            http_layout.addWidget(QtWidgets.QLabel("服务器 IP"), 1, 0)
+            http_layout.addWidget(self.http_ip_edit, 1, 1)
+            http_layout.addWidget(QtWidgets.QLabel("端口"), 1, 2)
+            http_layout.addWidget(self.http_port_edit, 1, 3)
+            http_layout.addWidget(QtWidgets.QLabel("路径"), 2, 0)
+            http_layout.addWidget(self.http_endpoint_edit, 2, 1, 1, 3)
+            http_layout.addWidget(self.http_button, 3, 0, 1, 4)
+            http_layout.addWidget(self.http_status, 4, 0, 1, 4)
+            http_layout.addWidget(self.http_stats, 5, 0, 1, 4)
+            http_layout.addWidget(self.http_detail, 6, 0, 1, 4)
 
             layout.addWidget(self.record_button)
             layout.addWidget(self.record_status)
@@ -991,6 +1004,32 @@ if QtWidgets is not None:
             layout.addWidget(reference_group)
             return tab
 
+        def _sync_http_preset(self, *_args) -> None:
+            selected = len(HTTP_PUSH_PRESETS)
+            for index, (_label, ip, port) in enumerate(HTTP_PUSH_PRESETS):
+                if self.http_ip_edit.text().strip() == ip and self.http_port_edit.value() == port:
+                    selected = index
+                    break
+            blocked = self.http_preset_combo.blockSignals(True)
+            self.http_preset_combo.setCurrentIndex(selected)
+            self.http_preset_combo.blockSignals(blocked)
+
+        def _apply_http_preset(self, _index=None) -> None:
+            if self.http_sender is not None:
+                self._sync_http_preset()
+                return
+            destination = self.http_preset_combo.currentData()
+            if destination is None:
+                return
+            ip, port = destination
+            ip_blocked = self.http_ip_edit.blockSignals(True)
+            port_blocked = self.http_port_edit.blockSignals(True)
+            self.http_ip_edit.setText(ip)
+            self.http_port_edit.setValue(port)
+            self.http_ip_edit.blockSignals(ip_blocked)
+            self.http_port_edit.blockSignals(port_blocked)
+            self._sync_http_preset()
+
         def _toggle_http_push(self) -> None:
             if self.http_sender is not None:
                 self._stop_http_push()
@@ -1044,12 +1083,17 @@ if QtWidgets is not None:
                 return
             payload = self.http_aggregator.ingest(batch, record)
             if payload is not None:
+                payload["units"] = "uV"
+                if "vref_v" in self.model.config and "pga_gain" in self.model.config:
+                    payload["vref_v"] = self.model.config["vref_v"]
+                    payload["pga_gain"] = self.model.config["pga_gain"]
                 self.http_sender.submit(payload)
 
         def _update_http_controls(self) -> None:
             active = self.http_sender is not None
             blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.tx_pending
             self.http_button.setEnabled(active or not blocked)
+            self.http_preset_combo.setEnabled(not active)
             self.http_ip_edit.setEnabled(not active)
             self.http_port_edit.setEnabled(not active)
             self.http_endpoint_edit.setEnabled(not active)

@@ -172,6 +172,76 @@ class ConnectionRecoveryTests(unittest.TestCase):
         self.ports_patch.stop()
         self.store_patch.stop()
 
+    def test_usb_pair_completion_restores_status_lost_during_handshake(self):
+        status = {"device_id": "P300_TEST", "mode": "serial",
+                  "ads_running": False, "ip": "0.0.0.0", "time_ready": False}
+        session = mock.Mock(connected=True, last_status=status)
+        # Status can arrive while the connection worker is still pairing/saving.
+        self.panel.handle("usb_status", {**status, "session": session})
+        self.panel.session = session
+        self.panel.busy = True
+        self.panel.handle("network_done", {"label": "USB 配对", "result": {"connected": True}})
+        self.assertIn("USB 已连接", self.panel.usb_status.text())
+        self.assertIn("P300_TEST", self.panel.usb_status.text())
+        self.assertIn("ADS 未启动", self.panel.usb_status.text())
+        self.assertEqual(self.panel.connect_button.text(), "断开 USB")
+        self.assertFalse(self.panel.busy)
+
+    def test_usb_connection_errors_are_visible_beside_connect_button(self):
+        for error in ("PermissionError(13, Access is denied)", "USB request timed out"):
+            with self.subTest(error=error):
+                self.panel.handle("network_done", {"label": "USB 配对", "error": error})
+                self.assertIn("USB 连接失败", self.panel.usb_status.text())
+                self.assertIn(error, self.panel.usb_status.text())
+        self.assertIn("USB request timed out", self.panel.operation_status.text())
+
+    def test_usb_pending_and_disconnect_clear_previous_status(self):
+        self.assertNotIn("占用", self.panel.usb_status.text())
+        self.panel.com.addItem("Test port", "FAKE")
+        with mock.patch.object(self.panel, "work"):
+            self.panel.connect_usb()
+        self.assertIn("正在连接", self.panel.usb_status.text())
+        self.assertIn("FAKE", self.panel.usb_status.text())
+        self.panel.handle("network_done", {"label": "断开 USB", "result": None})
+        self.assertIn("USB 已断开", self.panel.usb_status.text())
+
+    def test_network_validation_explains_disconnect_without_activating_wifi(self):
+        panel = self.panel
+        panel.session = mock.Mock(connected=True)
+        result = {"network_verified": True, "mode": "serial", "ip": "0.0.0.0",
+                  "warning": "PC settings could not be saved"}
+        with mock.patch.object(self.window, "_activate_transport") as activate:
+            panel.handle("network_done", {"label": "下发网络（最长约 20 秒）", "result": result})
+        activate.assert_not_called()
+        panel.session.manage.assert_not_called()
+        self.assertIn("验证结束后 Wi-Fi 已关闭", panel.operation_status.text())
+        self.assertIn("启用 Wi-Fi 数据模式", panel.operation_status.text())
+        self.assertIn(result["warning"], panel.operation_status.text())
+        self.assertTrue(panel.wifi_activate_button.isEnabled())
+
+    def test_wifi_activation_button_sends_mode_before_starting_receiver(self):
+        panel = self.panel
+        self.assertFalse(panel.wifi_activate_button.isEnabled())
+        panel.session = mock.Mock(connected=True)
+        panel.mode.setCurrentIndex(panel.mode.findData("serial"))
+        panel.update_buttons()
+        with mock.patch.object(panel, "work", side_effect=lambda label, fn: fn()):
+            with mock.patch.object(self.window, "_pause_transport_output") as pause:
+                with mock.patch.object(self.window, "_activate_transport") as activate:
+                    panel.wifi_activate_button.click()
+                    pause.assert_called_once()
+                    panel.session.manage.assert_called_once_with("mode", mode="wifi", timeout=4)
+                    activate.assert_not_called()
+                    panel.handle("network_done", {"label": "切换数据模式", "result": {"activate": "wifi"}})
+                    activate.assert_called_once_with("wifi")
+        self.assertIn("等待设备取得 IP", panel.operation_status.text())
+
+    def test_failed_mode_change_reports_known_ads_startup_failure(self):
+        self.panel.session = mock.Mock(connected=True, last_status={"ads_running": False})
+        self.panel.handle("network_done", {"label": "切换数据模式", "error": "mode_busy_or_unavailable"})
+        self.assertIn("ADS 未启动", self.panel.operation_status.text())
+        self.assertIn("mode_busy_or_unavailable", self.panel.operation_status.text())
+
     def test_manual_pc_address_overrides_previous_dropdown_selection(self):
         panel = self.panel
         panel.ssid.setEditText("TestNetwork")

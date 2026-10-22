@@ -27,3 +27,6 @@ __pycache__/
 !/firmware/partitions.csv
 *.log
 *.tmp
+
+# Per-computer HTTP destination settings.
+**/p300_http_push_settings.json

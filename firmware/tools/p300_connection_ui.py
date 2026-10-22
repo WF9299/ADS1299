@@ -39,7 +39,7 @@ class ConnectionPanel(QtWidgets.QWidget):
         grid.addWidget(self.baud, 0, 2)
         grid.addWidget(refresh, 0, 3)
         grid.addWidget(self.connect_button, 1, 0, 1, 4)
-        self.usb_status = QtWidgets.QLabel("USB 未连接；请先退出占用串口的 IDF monitor")
+        self.usb_status = QtWidgets.QLabel("USB 未连接；请选择串口后点击连接并配对")
         self.usb_status.setWordWrap(True)
         grid.addWidget(self.usb_status, 2, 0, 1, 4)
         self.mode = QtWidgets.QComboBox()
@@ -106,6 +106,8 @@ class ConnectionPanel(QtWidgets.QWidget):
         self.operation_status = QtWidgets.QLabel("首次配网/验证时请断开人体电极；不要旁路板上隔离。")
         self.operation_status.setWordWrap(True)
         layout.addWidget(self.operation_status)
+        self.wifi_activate_button = self.button("启用 Wi-Fi 数据模式", self.activate_wifi_mode)
+        layout.addWidget(self.wifi_activate_button)
         self.device_log = QtWidgets.QPlainTextEdit()
         self.device_log.setReadOnly(True)
         self.device_log.setMaximumBlockCount(200)
@@ -141,6 +143,7 @@ class ConnectionPanel(QtWidgets.QWidget):
             action.setEnabled(not self.busy)
         for action in (self.hotspot_start, self.hotspot_stop, self.hotspot_read):
             action.setEnabled(not self.busy and self.hotspot_available)
+        self.wifi_activate_button.setEnabled(not self.busy and self.session is not None and self.session.connected)
         self.mode.setEnabled(not self.busy)
         self.com.setEnabled(not self.busy and self.session is None)
         self.baud.setEnabled(not self.busy and self.session is None)
@@ -174,13 +177,16 @@ class ConnectionPanel(QtWidgets.QWidget):
                 self.owner._pause_transport_output()
             session = self.session
             self.session = None
+            self.usb_status.setText("正在断开 USB…")
             self.work("断开 USB", lambda: session.close())
             return
         port = self.com.currentData()
         baud = int(self.baud.currentText())
         if not port:
             self.operation_status.setText("没有可用串口")
+            self.usb_status.setText("USB 未连接：没有可用串口，请检查连接后刷新")
             return
+        self.usb_status.setText(f"正在连接 {port}：握手并配对…")
         def connect():
             session = SerialSession(port, baud, self.events)
             try:
@@ -200,6 +206,13 @@ class ConnectionPanel(QtWidgets.QWidget):
                 session.close()
                 raise
         self.work("USB 配对", connect)
+
+    def activate_wifi_mode(self):
+        if self.session is None or not self.session.connected:
+            self.operation_status.setText("请先连接 USB，再启用设备 Wi-Fi 数据模式")
+            return
+        self.mode.setCurrentIndex(self.mode.findData("wifi"))
+        self.apply_mode()
 
     def apply_mode(self):
         selected = self.mode.currentData()
@@ -306,7 +319,7 @@ class ConnectionPanel(QtWidgets.QWidget):
             self.wifi_status.setText(f"已发现设备 {result['host']}；校时 {'已同步' if result.get('synchronized') else '等待'}" +
                                     ("；" + result["error"] if result.get("error") else ""))
         elif kind == "usb_status":
-            self.usb_status.setText(f"设备 {result.get('device_id', '--')} | 实际 {result.get('mode', '--')} | ADS {'运行' if result.get('ads_running') else '未启动'} | Wi-Fi {result.get('ip', '--')} | 校时 {'就绪' if result.get('time_ready') else '等待'}")
+            self.usb_status.setText(f"USB 已连接 | 设备 {result.get('device_id', '--')} | 实际 {result.get('mode', '--')} | ADS {'运行' if result.get('ads_running') else '未启动'} | Wi-Fi {result.get('ip', '--')} | 校时 {'就绪' if result.get('time_ready') else '等待'}")
         elif kind == "usb_sync" and "rtt_us" in result:
             self.usb_status.setToolTip(f"串口同步 RTT {result['rtt_us']/1000:.2f} ms；不能据此保证刺激同步精度")
         elif kind == "usb_error":
@@ -316,18 +329,35 @@ class ConnectionPanel(QtWidgets.QWidget):
                 self.owner._pause_transport_output()
             if failed_session is not None:
                 failed_session.close()
-            self.usb_status.setText("USB 已断开，可重新连接并配对")
+            self.usb_status.setText("USB 已断开：" + result["error"] + "；可重新连接并配对")
             self.operation_status.setText("USB 错误：" + result["error"])
             self.update_buttons()
         elif kind == "network_done":
             self.busy = False
             if "error" in result:
                 self.operation_status.setText(result["label"] + "失败：" + result["error"])
+                if result["label"] == "USB 配对":
+                    self.usb_status.setText("USB 连接失败：" + result["error"])
+                elif (result["label"] == "切换数据模式" and result["error"] == "mode_busy_or_unavailable"
+                      and self.session is not None and self.session.last_status.get("ads_running") is False):
+                    self.operation_status.setText("切换数据模式失败：ADS 未启动，当前固件无法切换数据模式；请检查 ADS 初始化日志（mode_busy_or_unavailable）")
             else:
                 self.operation_status.setText(result["label"] + "完成；网络连上不等于 EEG/HTTP 已通过验证")
                 data = result.get("result") or {}
+                if data.get("connected") and self.session is not None:
+                    # Handshake status may arrive before the worker publishes its
+                    # session. Replay it even if ADS startup prevents clock updates.
+                    if self.session.connected:
+                        self.handle("usb_status", {**self.session.last_status, "session": self.session})
+                    else:
+                        self.handle("usb_error", {"error": "连接在配对完成前已中断", "session": self.session})
+                elif result["label"] == "断开 USB":
+                    self.usb_status.setText("USB 已断开，可重新连接并配对")
+                if data.get("network_verified"):
+                    self.operation_status.setText("网络已验证并保存；验证结束后 Wi-Fi 已关闭。保持 USB 连接，点击下方“启用 Wi-Fi 数据模式”建立持续连接。")
+                    self.wifi_status.setText("Wi-Fi：网络验证通过，尚未启用 Wi-Fi 数据模式")
                 if data.get("warning"):
-                    self.operation_status.setText(data["warning"])
+                    self.operation_status.setText(self.operation_status.text() + "；" + data["warning"])
                 if "credentials" in data:
                     self.ssid.setEditText(data["credentials"]["ssid"])
                     self.password.setText(data["credentials"]["password"])
@@ -354,6 +384,9 @@ class ConnectionPanel(QtWidgets.QWidget):
                         ("热点 API 可用，状态：" + capability["state"] if self.hotspot_available else capability["reason"]))
                 if "activate" in data:
                     self.owner._activate_transport(data["activate"])
+                    if data["activate"] == "wifi":
+                        self.operation_status.setText("已启用 Wi-Fi 数据模式；等待设备取得 IP、校时和 EEG 数据")
+                        self.wifi_status.setText("Wi-Fi 数据模式已启用；等待设备发现与时钟同步")
             self.update_buttons()
 
     def close(self):

@@ -55,7 +55,7 @@ python tools\p300_monitor.py --host 0.0.0.0 --port 1234
 
 The TCP binary EEG_BATCH v1 format and UDP marker, impedance, internal-short, BIAS and send-rate control messages are unchanged from the prior monitor. The PC monitor's JSONL/JSON/CSV/HTTP output remains the PC's responsibility.
 
-The 72 PC tests (53 original, 9 dual-transport and 10 recovery regressions) pass. Related GUI issues were repaired: external-resistor calibration (do not replace board 4.99kOhm), verified 1/2-frame send control and readable side-panel width. A fake serial peer validates existing controls, not real COM timing/noise/throughput.
+The 78 PC tests (53 original, 9 dual-transport and 16 recovery regressions) pass. Related GUI issues were repaired: external-resistor calibration (do not replace board 4.99kOhm), verified 1/2-frame send control and readable side-panel width. A fake serial peer validates existing controls, not real COM timing/noise/throughput.
 
 ## First use: USB / campus hotspot
 
@@ -90,3 +90,31 @@ Real-board acceptance remains:
 3. Validate the actual PC campus uplink and hotspot. Change the PC address, use USB to update the endpoint, and test unicast discovery where broadcasts are filtered.
 4. Switch serial/Wi-Fi repeatedly, check new stream IDs and re-synchronization, then restart recording/HTTP explicitly. While in Wi-Fi, unplug only the management USB link and verify data continues.
 5. Measure stimulus-to-sample timing on the actual link. Passing host tests does not establish hardware latency, loss-free capture or analog EEG quality.
+
+### USB connection diagnostics (2026-10-14)
+
+The USB status beside the connection button now reports connection progress, the actual device status, and connection errors. The previous default reminder about IDF monitor was not an occupancy check. Pair completion restores the latest handshake status even when early events arrived before the GUI adopted the session; this matters when ADS startup failed and clock synchronization cannot refresh the status.
+
+On the connected C5 board, COM7 successfully negotiated 115200 to 921600 and answered a status request with zero serial parser errors. Device P300_3844BE373428 reported serial mode, paired=true and ads_running=false. This verifies the USB management path only, not EEG acquisition or sustained serial throughput. After restarting the Monitor, select COM7/921600 and connect; investigate ADS startup logs separately if ADS remains stopped. No firmware change or new flash is required for this GUI fix.
+
+Provisioning validation does not leave Wi-Fi enabled: the device verifies association/DHCP, saves the network and stops Wi-Fi. The Monitor now states this explicitly and provides **启用 Wi-Fi 数据模式** below the operation result. Keep USB connected and click it to apply the saved Wi-Fi mode; network validation never switches transport automatically. Mode activation still requires the firmware stream task. If ADS startup failed, the GUI explains the resulting mode_busy_or_unavailable instead of treating it as a Wi-Fi password failure. These GUI changes need only a Monitor restart, not a firmware flash.
+
+
+### SSVEP display filter (2026-10-20)
+
+The display/FFT filter selector now includes **SSVEP 6–90 Hz + 50 Hz narrow stop (realtime)**.
+It uses a Butterworth order-2 49.5–50.5 Hz bandstop followed by an order-4 6–90 Hz bandpass,
+with continuous causal SOS state across packets. This matches the design bands/orders of
+`filter_eeg.m`; it is not the same operation as the SSVEP program's window-local forward/backward
+zero-phase filtering. Sampling rate must exceed 180 SPS. Official recordings, raw quality
+statistics and localhost HTTP still use raw microvolts. Internal-short data bypass display
+filters. No firmware change or reflashing is needed; restart Monitor to see the new mode.
+
+
+### HTTP destination presets (2026-10-20)
+
+The Record tab includes **SSVEP测试 — 127.0.0.1:25001** and
+**SEU电视端 — 10.201.1.182:25000**, plus Custom. Selecting a preset fills IP and port;
+the endpoint path is preserved (normally `/api/bci/data`). It does not start HTTP or
+overwrite the last saved destination. Start HTTP saves the current fields as before.
+Presets and destination fields are locked while HTTP is active; stop before switching.

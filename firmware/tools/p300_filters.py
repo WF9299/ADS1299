@@ -26,12 +26,16 @@ class FilterMode(str, Enum):
     RAW = "raw"
     NOTCH_50 = "notch_50"
     P300 = "p300"
+    P300_2_30 = "p300_2_30"
+    SSVEP = "ssvep"
 
 
 FILTER_MODE_LABELS = {
     FilterMode.RAW: "原始（仅波形去直流）",
     FilterMode.NOTCH_50: "48–52 Hz工频带阻",
     FilterMode.P300: "P300 0.5–30 Hz + 工频抑制",
+    FilterMode.P300_2_30: "P300 2–30 Hz + 工频抑制",
+    FilterMode.SSVEP: "SSVEP 6–90 Hz + 50 Hz窄带阻（实时）",
 }
 
 
@@ -90,6 +94,19 @@ class RealtimeEegFilter:
         if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 2.0 * MAINS_STOP_HIGH_HZ:
             raise ValueError("显示滤波要求sampling_rate大于104 Hz")
 
+        if mode == FilterMode.SSVEP:
+            if sample_rate_hz <= 180:
+                raise ValueError("SSVEP 6–90 Hz滤波要求采样率大于180 Hz")
+            # Same design edges/orders as filter_eeg.m; continuous causal SOS.
+            # The SSVEP analysis program separately uses window-local filtfilt.
+            narrow_stop = scipy_signal.butter(
+                2, (49.5, 50.5), btype="bandstop", fs=sample_rate_hz, output="sos"
+            )
+            bandpass = scipy_signal.butter(
+                4, (6.0, 90.0), btype="bandpass", fs=sample_rate_hz, output="sos"
+            )
+            return np.vstack((narrow_stop, bandpass)).astype(np.float64, copy=False)
+
         mains_stop_sos = scipy_signal.butter(
             MAINS_STOP_ORDER,
             (MAINS_STOP_LOW_HZ, MAINS_STOP_HIGH_HZ),
@@ -99,10 +116,11 @@ class RealtimeEegFilter:
         )
         if mode == FilterMode.NOTCH_50:
             return np.asarray(mains_stop_sos, dtype=np.float64)
-        if mode == FilterMode.P300:
+        if mode in (FilterMode.P300, FilterMode.P300_2_30):
+            low_hz = 2.0 if mode == FilterMode.P300_2_30 else P300_LOW_HZ
             bandpass_sos = scipy_signal.butter(
                 P300_BANDPASS_ORDER,
-                (P300_LOW_HZ, P300_HIGH_HZ),
+                (low_hz, P300_HIGH_HZ),
                 btype="bandpass",
                 fs=sample_rate_hz,
                 output="sos",

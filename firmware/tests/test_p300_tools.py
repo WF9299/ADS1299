@@ -524,23 +524,35 @@ class P300ToolProtocolTests(unittest.TestCase):
             self.assertLess(gain, 1.01)
 
         indices = np.arange(30000, dtype=np.float64)
-        p300_input = (
-            np.sin(2 * np.pi * 0.1 * indices / rate)
-            + np.sin(2 * np.pi * 10.0 * indices / rate)
-            + np.sin(2 * np.pi * 50.0 * indices / rate)
+        p300_input = sum(
+            np.sin(2 * np.pi * frequency * indices / rate)
+            for frequency in (0.1, 1.0, 2.0, 10.0, 30.0, 50.0)
         )
         p300_values = np.repeat(p300_input[:, None], 8, axis=1)
-        p300 = RealtimeEegFilter(FilterMode.P300)
-        p300_output = p300.process(
-            p300_values,
-            sample_rate_hz=rate,
-            stream_id=1,
-            config_id=CONFIG_NORMAL,
-            start_seq=0,
-        )
-        self.assertLess(amplitude(p300_output, 0.1, 10000), 0.1)
-        self.assertLess(amplitude(p300_output, 50.0, 10000), 10 ** (-25.0 / 20.0))
-        self.assertAlmostEqual(amplitude(p300_output, 10.0, 10000), 1.0, delta=0.02)
+        original_values = p300_values.copy()
+        for mode in (FilterMode.P300, FilterMode.P300_2_30):
+            with self.subTest(mode=mode):
+                p300 = RealtimeEegFilter(mode)
+                p300_output = np.vstack([
+                    p300.process(
+                        p300_values[start:start + 20],
+                        sample_rate_hz=rate,
+                        stream_id=1,
+                        config_id=CONFIG_NORMAL,
+                        start_seq=start,
+                    )
+                    for start in range(0, len(p300_values), 20)
+                ])
+                self.assertLess(amplitude(p300_output, 0.1, 10000), 0.1)
+                self.assertLess(amplitude(p300_output, 50.0, 10000), 10 ** (-25.0 / 20.0))
+                self.assertAlmostEqual(amplitude(p300_output, 10.0, 10000), 1.0, delta=0.02)
+                self.assertAlmostEqual(amplitude(p300_output, 30.0, 10000), 2 ** -0.5, delta=0.02)
+                if mode == FilterMode.P300_2_30:
+                    self.assertLess(amplitude(p300_output, 1.0, 10000), 0.1)
+                    self.assertAlmostEqual(amplitude(p300_output, 2.0, 10000), 2 ** -0.5, delta=0.02)
+                else:
+                    self.assertGreater(amplitude(p300_output, 1.0, 10000), 0.9)
+        np.testing.assert_array_equal(p300_values, original_values)
 
     @unittest.skipUnless(SCIPY_AVAILABLE, "SciPy unavailable")
     def test_realtime_filter_chunking_reset_and_internal_short_bypass(self) -> None:
@@ -1816,6 +1828,21 @@ class P300ToolProtocolTests(unittest.TestCase):
                 self.assertTrue(window.force_markers_enabled)
                 self.assertIn("记录/HTTP：原始EEG", window.filter_status.text())
 
+                self.assertGreaterEqual(window.filter_combo.findData(FilterMode.P300.value), 0)
+                new_index = window.filter_combo.findData(FilterMode.P300_2_30.value)
+                self.assertGreaterEqual(new_index, 0)
+                window.filter_combo.setCurrentIndex(new_index)
+                self.assertEqual(window.display_filter.mode, FilterMode.P300_2_30)
+                self.assertIn("2–30 Hz", window.filter_status.text())
+                self.assertIn("记录/HTTP：原始EEG", window.filter_status.text())
+
+                ssvep_index = window.filter_combo.findData(FilterMode.SSVEP.value)
+                self.assertGreaterEqual(ssvep_index, 0)
+                window.filter_combo.setCurrentIndex(ssvep_index)
+                self.assertEqual(window.display_filter.mode, FilterMode.SSVEP)
+                self.assertIn("6–90 Hz", window.filter_status.text())
+                self.assertIn("记录/HTTP：原始EEG", window.filter_status.text())
+
                 captured_http_records = []
                 window._submit_http_batch = lambda _batch, record: captured_http_records.append(record)
                 process_calls = []
@@ -1860,7 +1887,7 @@ class P300ToolProtocolTests(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(internal_display, expected_internal)
                 self.assertEqual(len(process_calls), 1)
-                self.assertEqual(window.filter_combo.currentData(), FilterMode.NOTCH_50.value)
+                self.assertEqual(window.filter_combo.currentData(), FilterMode.SSVEP.value)
             finally:
                 window.close()
                 application.processEvents()
