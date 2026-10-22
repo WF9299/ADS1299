@@ -30,3 +30,8 @@ __pycache__/
 
 # Per-computer HTTP destination settings.
 **/p300_http_push_settings.json
+
+# Per-computer SSVEP settings, calibration and experiment output.
+/ssvep_realtime_test_settings.json
+/ssvep_realtime_calibration.json
+/outputs/ssvep_realtime/

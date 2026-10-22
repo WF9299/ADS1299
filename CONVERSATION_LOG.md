@@ -457,3 +457,16 @@ firmware/tools/p300_http_push.py、tools/p300_monitor.py、tests/test_p300_http_
 完成固件2.2.0与Monitor独立BIAS启停，USB/Wi-Fi复用现有控制；关闭CONFIG3=0xE8且BIAS_SENSP/N=0，正常EEG输入/参考/PGA不变，三个寄存器回读。DISABLE操作及POWER_CONTROL能力位区分旧固件，零有效掩码VERIFIED为关闭、未验证为未知；关闭保留GUI通道草稿，重启设备默认开启，不写NVS。暂停切换、稳定样本隔离、失败恢复原开启/关闭状态，回滚失败保持暂停且禁用该故障的自动恢复。恢复路径保留当前正常BIAS掩码。Wi-Fi切换后短重连刷新STREAM_CONFIG，USB发布新CONFIG，原始JSONL/HTTP包含BIAS元信息且EEG值不变。
 
 完整92项Python测试通过13.205秒，包含9项新增协议/USB/UDP/GUI/生产C函数故障注入，扩展主机C协议测试通过，ESP-IDF6.0.2编译成功。应用1050880字节，SHA256 f2cb76802a279d75709eec7214ee9c352233447be229674bdc7723b83a81be4c。逐文件哈希核对应用20个实现/测试/说明文件，静态开启/关闭/旧固件界面已检查。实板未烧录，模拟电气效果未验证。烧录包位于配套项目outputs/ssvep_realtime/bias-power-2.2.0/c5-ads1299-2.2.0-bias.zip；使用时烧录新固件并重启Monitor，先停止记录/HTTP，在阻抗页取消启用BIAS、应用并等待关闭VERIFIED；重新勾选可恢复。
+
+## 2026-10-23
+
+### 第36轮
+
+**用户**:
+要求远程推送并更新中文README，明确要求将配套SSVEP程序放入同一个GitLab仓库，随后要求继续。
+
+**Codex**:
+将独立SSVEP1.3源码、测试和两个启动入口整合到本仓库根目录，与firmware并列。只复制26个受版本管理的文件，不包含旧P4工程、实测数据、本机设置或Git历史。根README和firmware/README改为中文，覆盖安装、USB/热点配网、HTTP预设、显示滤波、BIAS2.2启停和SSVEP连接；SSVEP说明去除绝对路径并明确独立模拟测试端口。新增SSVEP运行文件忽略规则。准备在整合目录验证后提交并推送当前分支；不烧录或占用设备。
+
+**验证与发布范围**:
+统一目录下51项SSVEP测试全部通过15.842秒，含动态候选、实时柱图、切频边界、模拟HTTP和退出清理。两个程序--help、C5范围检查、源码逐字节比对、中文UTF-8/相对链接和git差异格式检查通过；本机设置/实验目录忽略规则生效。新增SSVEP与中文说明即将提交并推送既有分支codex/usb-provisioning-dual-transport，保留既有固件/Monitor提交；未更改采集代码、烧录或接管COM。发布结果由远程分支提交核验。
