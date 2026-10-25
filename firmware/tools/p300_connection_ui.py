@@ -48,6 +48,7 @@ class ConnectionPanel(QtWidgets.QWidget):
         grid.addWidget(self.mode, 3, 0, 1, 2)
         grid.addWidget(self.button("应用数据模式", self.apply_mode), 3, 2, 1, 2)
         layout.addWidget(usb)
+        layout.addWidget(owner._build_gain_group())
 
         wifi = QtWidgets.QGroupBox("USB 下发 Wi-Fi：无需修改源码或烧录")
         form = QtWidgets.QGridLayout(wifi)

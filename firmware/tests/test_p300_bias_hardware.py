@@ -11,7 +11,7 @@ import unittest
 
 
 def function_body(source, name):
-    match = re.search(r'^(?:static )?(?:esp_err_t|eeg_acq_bias_switch_status_t)\s+'
+    match = re.search(r'^(?:static )?(?:esp_err_t|eeg_acq_bias_switch_status_t|eeg_acq_gain_switch_status_t|eeg_acq_mode_switch_status_t)\s+'
                       + re.escape(name) + r'\([^;]+?\)\s*\{', source, re.M)
     if match is None:
         raise AssertionError('Missing production function '+name)
@@ -32,10 +32,12 @@ class BiasHardwareTests(unittest.TestCase):
         acquire = (root/'components/eeg_acq/eeg_acq.c').read_text()
         fixture = root/'tests/fixtures'
         code = (fixture/'bias_hardware_prefix.h').read_text()
-        for name in ('ads1299_apply_verified_reference_config_impl',
+        for name in ('ads1299_gain_bits', 'ads1299_apply_verified_reference_config_impl',
                      'ads1299_apply_verified_reference_config_with_bias',
+                     'ads1299_apply_normal_config',
                      'ads1299_set_bias_sensp_verified'):
             code += function_body(driver, name)
+        code += function_body(acquire, 'apply_normal_config')
         code += function_body(acquire, 'eeg_acq_set_normal_bias_mask')
         code += (fixture/'bias_hardware_cases.c').read_text()
         with tempfile.TemporaryDirectory() as folder:

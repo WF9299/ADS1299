@@ -171,5 +171,39 @@ class HttpTests(unittest.TestCase):
                 validate_packet({**payload(time.time()), **extra})
 
 
+    def test_runtime_gain_change_discards_old_analysis_window(self):
+        port = free_port()
+        controller = WorkerController(Settings(port=port, window_seconds=1, update_seconds=.1,
+            stale_seconds=3, analysis_profile="focused", harmonics=2))
+        controller.start()
+        controller.begin(time.time() - 2)
+        def await_gain(gain):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                result = controller.poll()
+                if result and result.get("input_context", {}).get("pga_gain") == gain:
+                    return result
+                time.sleep(.02)
+            self.fail(f"No result for gain {gain}")
+        try:
+            epoch = time.time() - 1
+            data = samples(17, 1000, 0, 1000, np.random.default_rng(21))
+            first = payload(epoch, data)
+            first.update(units="uV", vref_v=4.5, pga_gain=12)
+            post(port, first)
+            full = await_gain(12)
+            self.assertTrue(full["valid"], full)
+            second = payload(epoch + 1, data[:200])
+            second.update(units="uV", vref_v=4.5, pga_gain=24)
+            post(port, second)
+            changed = await_gain(24)
+            self.assertFalse(changed["valid"])
+            self.assertGreater(changed["resets"], full["resets"])
+            self.assertEqual(changed["input_context"]["fullscale_uv"], 187500)
+            self.assertNotIn("cca_frequency", changed)
+        finally:
+            controller.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

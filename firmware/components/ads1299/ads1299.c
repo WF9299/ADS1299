@@ -260,13 +260,54 @@ esp_err_t ads1299_read_id(uint8_t *id)
     return ads1299_read_reg(ADS1299_REG_ID, id);
 }
 
+esp_err_t ads1299_gain_bits(uint8_t gain, uint8_t *bits)
+{
+    if (bits == NULL) return ESP_ERR_INVALID_ARG;
+    switch (gain) {
+    case 1: *bits = 0x00; break;
+    case 2: *bits = 0x10; break;
+    case 4: *bits = 0x20; break;
+    case 6: *bits = 0x30; break;
+    case 8: *bits = 0x40; break;
+    case 12: *bits = 0x50; break;
+    case 24: *bits = 0x60; break;
+    default: return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
+esp_err_t ads1299_set_gain_verified(uint8_t gain)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    uint8_t bits;
+    ESP_RETURN_ON_ERROR(ads1299_gain_bits(gain, &bits), TAG, "invalid gain");
+    uint8_t expected[8];
+    /* Capture every channel before any write; preserve PD, SRB2 and MUX. */
+    for (uint8_t ch = 0; ch < 8; ++ch) {
+        ESP_RETURN_ON_ERROR(ads1299_read_reg(ADS1299_REG_CH1SET + ch, &expected[ch]),
+                            TAG, "read gain channel");
+        expected[ch] = (expected[ch] & 0x8FU) | bits;
+    }
+    for (uint8_t ch = 0; ch < 8; ++ch) {
+        ESP_RETURN_ON_ERROR(ads1299_write_reg(ADS1299_REG_CH1SET + ch, expected[ch]),
+                            TAG, "write gain channel");
+    }
+    for (uint8_t ch = 0; ch < 8; ++ch) {
+        ESP_RETURN_ON_ERROR(ads1299_check_reg(ADS1299_REG_CH1SET + ch, expected[ch]),
+                            TAG, "verify gain channel");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t ads1299_apply_verified_reference_config_impl(bool enable_all_channels,
-                                                              uint8_t bias_pos)
+                                                              uint8_t bias_pos, uint8_t gain)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    uint8_t gain_bits;
+    ESP_RETURN_ON_ERROR(ads1299_gain_bits(gain, &gain_bits), TAG, "invalid gain");
     const uint8_t mask = enable_all_channels ? 0xFF : s_config.enabled_channel_mask;
     if ((bias_pos & (uint8_t)~mask) != 0U) {
         return ESP_ERR_INVALID_ARG;
@@ -285,8 +326,7 @@ static esp_err_t ads1299_apply_verified_reference_config_impl(bool enable_all_ch
     for (uint8_t ch = 0; ch < 8; ++ch) {
         const uint8_t reg = (uint8_t)(ADS1299_REG_CH1SET + ch);
         const bool enabled = (mask & (1U << ch)) != 0;
-        const uint8_t value = enabled ? ADS1299_CHSET_GAIN12_NORMAL
-                                      : ADS1299_CHSET_POWERDOWN_GAIN12_SHORT;
+        const uint8_t value = enabled ? gain_bits : (uint8_t)(0x81U | gain_bits);
         ESP_RETURN_ON_ERROR(ads1299_write_reg(reg, value), TAG, "write CH%uSET", (unsigned)(ch + 1));
     }
 
@@ -312,8 +352,7 @@ static esp_err_t ads1299_apply_verified_reference_config_impl(bool enable_all_ch
     for (uint8_t ch = 0; ch < 8; ++ch) {
         const uint8_t reg = (uint8_t)(ADS1299_REG_CH1SET + ch);
         const bool enabled = (mask & (1U << ch)) != 0;
-        const uint8_t value = enabled ? ADS1299_CHSET_GAIN12_NORMAL
-                                      : ADS1299_CHSET_POWERDOWN_GAIN12_SHORT;
+        const uint8_t value = enabled ? gain_bits : (uint8_t)(0x81U | gain_bits);
         ESP_RETURN_ON_ERROR(ads1299_check_reg(reg, value), TAG, "check CH%uSET", (unsigned)(ch + 1));
     }
     ESP_RETURN_ON_ERROR(ads1299_check_reg(ADS1299_REG_MISC1, 0x20), TAG, "check MISC1");
@@ -331,12 +370,17 @@ static esp_err_t ads1299_apply_verified_reference_config_impl(bool enable_all_ch
 esp_err_t ads1299_apply_verified_reference_config(bool enable_all_channels)
 {
     const uint8_t mask = enable_all_channels ? 0xFFU : s_config.enabled_channel_mask;
-    return ads1299_apply_verified_reference_config_impl(enable_all_channels, mask);
+    return ads1299_apply_verified_reference_config_impl(enable_all_channels, mask, 12U);
 }
 
 esp_err_t ads1299_apply_verified_reference_config_with_bias(uint8_t bias_mask)
 {
-    return ads1299_apply_verified_reference_config_impl(false, bias_mask);
+    return ads1299_apply_verified_reference_config_impl(false, bias_mask, 12U);
+}
+
+esp_err_t ads1299_apply_normal_config(uint8_t bias_mask, uint8_t gain)
+{
+    return ads1299_apply_verified_reference_config_impl(false, bias_mask, gain);
 }
 
 esp_err_t ads1299_set_bias_sensp_verified(uint8_t bias_mask)

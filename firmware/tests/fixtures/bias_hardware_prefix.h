@@ -24,6 +24,8 @@ enum { EEG_ACQ_BIAS_SWITCH_OK=0, EEG_ACQ_BIAS_SWITCH_INVALID_REQUEST=2,
 static struct { uint8_t enabled_channel_mask; } s_config = {0xff};
 static bool s_initialized=true, s_running=true, s_paused=false, s_pause_requested=false;
 static bool s_normal_bias_verified=true;
+static bool s_gain_verified=true;
+static uint8_t s_normal_gain=12;
 static uint8_t s_config_id=1, s_normal_bias_mask=0xff;
 static unsigned s_discard_samples;
 static const void *s_board=(void*)1;

@@ -92,6 +92,17 @@ uint8_t eeg_acq_get_normal_bias_mask(void);
 bool eeg_acq_normal_bias_is_verified(void);
 bool eeg_acq_is_settling(void);
 eeg_acq_bias_switch_status_t eeg_acq_set_normal_bias_mask(uint8_t target_mask);
+typedef enum {
+    EEG_ACQ_GAIN_SWITCH_OK = 0,
+    EEG_ACQ_GAIN_SWITCH_INVALID_REQUEST = 2,
+    EEG_ACQ_GAIN_SWITCH_APPLY_FAILED = 4,
+    EEG_ACQ_GAIN_SWITCH_RESTORE_FAILED = 5,
+    EEG_ACQ_GAIN_SWITCH_INTERNAL_ERROR = 6,
+} eeg_acq_gain_switch_status_t;
+uint8_t eeg_acq_get_normal_gain(void);
+uint8_t eeg_acq_get_gain(void);
+bool eeg_acq_gain_is_verified(void);
+eeg_acq_gain_switch_status_t eeg_acq_set_normal_gain(uint8_t target_gain);
 esp_err_t eeg_acq_measure_impedance(uint8_t channel_mask,
                                     eeg_acq_impedance_result_t *result);
 

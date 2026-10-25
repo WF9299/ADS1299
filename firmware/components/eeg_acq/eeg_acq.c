@@ -75,15 +75,27 @@ static volatile uint8_t s_config_id = EEG_ACQ_CONFIG_NORMAL;
 static volatile uint16_t s_discard_samples;
 static volatile uint8_t s_normal_bias_mask = P300_ADS_CHANNEL_MASK;
 static volatile bool s_normal_bias_verified;
+static volatile uint8_t s_normal_gain = 12U;
+static volatile bool s_gain_verified;
 #if P300_ADS1299_INTERNAL_TEST
 static ads1299_self_test_t s_self_test;
 #endif
 
+static esp_err_t apply_normal_config(uint8_t bias_mask)
+{
+    s_gain_verified = false;
+    const esp_err_t err = ads1299_apply_normal_config(bias_mask, s_normal_gain);
+    s_gain_verified = err == ESP_OK;
+    return err;
+}
+
 static esp_err_t apply_ads1299_capture_config(void)
 {
-    return s_config_id == EEG_ACQ_CONFIG_INTERNAL_SHORT
-               ? ads1299_apply_internal_short_config()
-               : ads1299_apply_verified_reference_config_with_bias(s_normal_bias_mask);
+    s_gain_verified = false;
+    const esp_err_t err = s_config_id == EEG_ACQ_CONFIG_INTERNAL_SHORT
+        ? ads1299_apply_internal_short_config() : apply_normal_config(s_normal_bias_mask);
+    s_gain_verified = err == ESP_OK;
+    return err;
 }
 
 #if P300_ADS1299_INTERNAL_TEST
@@ -358,6 +370,13 @@ bool eeg_acq_normal_bias_is_verified(void)
     return s_normal_bias_verified;
 }
 
+uint8_t eeg_acq_get_normal_gain(void) { return s_normal_gain; }
+uint8_t eeg_acq_get_gain(void)
+{
+    return s_config_id == EEG_ACQ_CONFIG_INTERNAL_SHORT ? 12U : s_normal_gain;
+}
+bool eeg_acq_gain_is_verified(void) { return s_gain_verified; }
+
 bool eeg_acq_is_settling(void)
 {
     return s_discard_samples > 0U;
@@ -425,6 +444,7 @@ static esp_err_t resume_after_mode_config(void)
     if (err != ESP_OK) {
         return err;
     }
+    s_discard_samples = EEG_ACQ_MODE_SETTLE_SAMPLES;
     s_last_acq_us = esp_timer_get_time();
     s_pause_requested = false;
     s_paused = false;
@@ -456,13 +476,15 @@ eeg_acq_mode_switch_status_t eeg_acq_set_config_id(uint8_t target_config_id)
     }
     eeg_acq_clear_buffer();
 
+    s_gain_verified = false;
     esp_err_t err = target_config_id == EEG_ACQ_CONFIG_INTERNAL_SHORT
                         ? ads1299_apply_internal_short_config()
-                        : ads1299_apply_verified_reference_config_with_bias(s_normal_bias_mask);
+                        : apply_normal_config(s_normal_bias_mask);
     if (err == ESP_OK) {
         err = resume_after_mode_config();
     }
     if (err == ESP_OK) {
+        s_gain_verified = true;
         s_config_id = target_config_id;
         if (target_config_id == EEG_ACQ_CONFIG_NORMAL) {
             s_normal_bias_verified = true;
@@ -477,11 +499,12 @@ eeg_acq_mode_switch_status_t eeg_acq_set_config_id(uint8_t target_config_id)
     ESP_LOGE(TAG, "ADS1299 target config failed; restoring NORMAL: %s",
              esp_err_to_name(err));
     ads1299_stop_continuous();
-    if (ads1299_apply_verified_reference_config_with_bias(s_normal_bias_mask) != ESP_OK ||
+    if (apply_normal_config(s_normal_bias_mask) != ESP_OK ||
         resume_after_mode_config() != ESP_OK) {
         ESP_LOGE(TAG, "ADS1299 NORMAL restore failed; acquisition remains paused");
         s_config_id = previous_config_id;
         s_normal_bias_verified = false;
+        s_gain_verified = false;
         s_pause_requested = true;
         s_paused = true;
         return EEG_ACQ_MODE_SWITCH_RESTORE_FAILED;
@@ -537,9 +560,10 @@ eeg_acq_bias_switch_status_t eeg_acq_set_normal_bias_mask(uint8_t target_mask)
     s_normal_bias_mask = previous_mask;
     s_discard_samples = EEG_ACQ_MODE_SETTLE_SAMPLES;
     ads1299_stop_continuous();
-    if (ads1299_apply_verified_reference_config_with_bias(previous_mask) != ESP_OK ||
+    if (apply_normal_config(previous_mask) != ESP_OK ||
         resume_after_mode_config() != ESP_OK) {
         s_normal_bias_verified = false;
+        s_gain_verified = false;
         s_pause_requested = true;
         s_paused = true;
         eeg_acq_clear_buffer();
@@ -552,6 +576,54 @@ eeg_acq_bias_switch_status_t eeg_acq_set_normal_bias_mask(uint8_t target_mask)
     s_discard_samples = EEG_ACQ_MODE_SETTLE_SAMPLES;
     eeg_acq_clear_buffer();
     return EEG_ACQ_BIAS_SWITCH_APPLY_FAILED;
+}
+
+eeg_acq_gain_switch_status_t eeg_acq_set_normal_gain(uint8_t target_gain)
+{
+    uint8_t bits;
+    if (ads1299_gain_bits(target_gain, &bits) != ESP_OK)
+        return EEG_ACQ_GAIN_SWITCH_INVALID_REQUEST;
+    if (!s_running || s_board == NULL || s_config_id != EEG_ACQ_CONFIG_NORMAL)
+        return EEG_ACQ_GAIN_SWITCH_INTERNAL_ERROR;
+    if (target_gain == s_normal_gain && s_gain_verified && !s_paused)
+        return EEG_ACQ_GAIN_SWITCH_OK;
+
+    const uint8_t previous_gain = s_normal_gain;
+    const uint8_t previous_bias = s_normal_bias_mask;
+    esp_err_t err = eeg_acq_pause_ads1299_stream();
+    if (err != ESP_OK && !s_paused)
+        return EEG_ACQ_GAIN_SWITCH_APPLY_FAILED;
+    eeg_acq_clear_buffer();
+    s_gain_verified = false;
+    s_discard_samples = EEG_ACQ_MODE_SETTLE_SAMPLES;
+    if (err == ESP_OK) err = ads1299_set_gain_verified(target_gain);
+    if (err == ESP_OK) {
+        s_normal_gain = target_gain;
+        err = resume_after_mode_config();
+    }
+    if (err == ESP_OK) {
+        s_gain_verified = true;
+        eeg_acq_clear_buffer();
+        return EEG_ACQ_GAIN_SWITCH_OK;
+    }
+
+    s_normal_gain = previous_gain;
+    ads1299_stop_continuous();
+    /* Gain-only rollback preserves the channel PD/MUX/SRB2 fields too. */
+    if (ads1299_set_gain_verified(previous_gain) != ESP_OK ||
+        ads1299_set_bias_sensp_verified(previous_bias) != ESP_OK ||
+        resume_after_mode_config() != ESP_OK) {
+        s_gain_verified = false;
+        s_normal_bias_verified = false;
+        s_pause_requested = true;
+        s_paused = true;
+        eeg_acq_clear_buffer();
+        return EEG_ACQ_GAIN_SWITCH_RESTORE_FAILED;
+    }
+    s_gain_verified = true;
+    s_normal_bias_verified = true;
+    eeg_acq_clear_buffer();
+    return EEG_ACQ_GAIN_SWITCH_APPLY_FAILED;
 }
 
 static esp_err_t begin_measurement_capture(void)
@@ -674,6 +746,12 @@ esp_err_t eeg_acq_measure_impedance(uint8_t channel_mask,
     result->tested_mask = tested_mask;
     eeg_acq_clear_buffer();
 
+    s_gain_verified = false;  /* Diagnostic samples use their own fixed scale. */
+    err = ads1299_apply_normal_config(s_normal_bias_mask, 12U);
+    if (err != ESP_OK) {
+        result->status = EEG_ACQ_IMPEDANCE_STATUS_CONFIG_FAILED;
+        goto cleanup;
+    }
     err = ads1299_configure_leadoff_dc(tested_mask);
     if (err != ESP_OK || ads1299_start_continuous() != ESP_OK) {
         result->status = EEG_ACQ_IMPEDANCE_STATUS_CONFIG_FAILED;
@@ -690,7 +768,7 @@ esp_err_t eeg_acq_measure_impedance(uint8_t channel_mask,
     result->open_mask = dc_result.loff_statp;
     result->flags |= EEG_ACQ_IMPEDANCE_FLAG_DC_VALID;
 
-    err = apply_ads1299_capture_config();
+    err = ads1299_apply_normal_config(s_normal_bias_mask, 12U);
     if (err != ESP_OK) {
         result->status = EEG_ACQ_IMPEDANCE_STATUS_CONFIG_FAILED;
         goto cleanup;
@@ -861,6 +939,7 @@ static void restart_ads_stream(const char *reason)
     }
     if (err != ESP_OK) {
         s_normal_bias_verified = false;
+        s_gain_verified = false;
         s_pause_requested = true;
         s_paused = true;
         s_health_reset_requested = true;
@@ -1062,6 +1141,8 @@ esp_err_t eeg_acq_start(const board_config_t *board)
     s_config_id = EEG_ACQ_CONFIG_NORMAL;
     s_discard_samples = 0U;
     s_normal_bias_mask = P300_ADS_CHANNEL_MASK;
+    s_normal_gain = 12U;
+    s_gain_verified = false;
     s_normal_bias_verified = false;
 #if P300_ADS1299_INTERNAL_TEST
     reset_ads1299_self_test();

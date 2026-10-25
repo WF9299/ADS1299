@@ -499,3 +499,65 @@ size_t p300_build_tx_control_result(const p300_tx_control_result_t *result,
     put_u32_be(&packet[16], p300_crc32c(packet, 16));
     return P300_TX_CONTROL_RESULT_BYTES;
 }
+
+bool p300_gain_valid(uint8_t gain)
+{
+    return gain == 1 || gain == 2 || gain == 4 || gain == 6 ||
+           gain == 8 || gain == 12 || gain == 24;
+}
+
+p300_gain_parse_status_t p300_parse_gain_control_request(
+    const uint8_t *packet,
+    size_t packet_size,
+    p300_gain_control_request_t *request)
+{
+    if (packet == NULL || request == NULL ||
+        packet_size != P300_GAIN_CONTROL_REQUEST_BYTES ||
+        packet[0] != 0xA5 || packet[1] != 0x51 || packet[2] != 1 ||
+        packet[3] != P300_UDP_TYPE_GAIN_CONTROL_REQUEST) {
+        return P300_GAIN_PARSE_DROP;
+    }
+    if (get_u32_be(&packet[12]) != p300_crc32c(packet, 12)) {
+        return P300_GAIN_PARSE_DROP;
+    }
+
+    request->request_id = get_u32_be(&packet[4]);
+    request->operation = (p300_gain_operation_t)packet[8];
+    request->requested_gain = packet[9];
+    const bool operation_valid =
+        request->operation == P300_GAIN_OPERATION_QUERY ||
+        request->operation == P300_GAIN_OPERATION_SET;
+    const bool gain_valid =
+        (request->operation == P300_GAIN_OPERATION_QUERY &&
+         request->requested_gain == 0U) ||
+        (request->operation == P300_GAIN_OPERATION_SET &&
+         p300_gain_valid(request->requested_gain));
+    if (request->request_id == 0U || !operation_valid || !gain_valid ||
+        packet[10] != 0U || packet[11] != 0U) {
+        return P300_GAIN_PARSE_INVALID;
+    }
+    return P300_GAIN_PARSE_OK;
+}
+
+size_t p300_build_gain_control_result(const p300_gain_control_result_t *result,
+                                      uint8_t *packet,
+                                      size_t packet_size)
+{
+    if (result == NULL || packet == NULL || packet_size < P300_GAIN_CONTROL_RESULT_BYTES) {
+        return 0;
+    }
+
+    memset(packet, 0, P300_GAIN_CONTROL_RESULT_BYTES);
+    packet[0] = 0xA5;
+    packet[1] = 0x51;
+    packet[2] = 1;
+    packet[3] = P300_UDP_TYPE_GAIN_CONTROL_RESULT;
+    put_u32_be(&packet[4], result->request_id);
+    packet[8] = (uint8_t)result->status;
+    packet[9] = result->requested_gain;
+    packet[10] = result->actual_gain;
+    packet[11] = result->flags;
+    put_u32_be(&packet[12], result->stream_id);
+    put_u32_be(&packet[16], p300_crc32c(packet, 16));
+    return P300_GAIN_CONTROL_RESULT_BYTES;
+}

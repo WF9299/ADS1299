@@ -21,6 +21,7 @@
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
 #include "p300_bias_state.h"
+#include "p300_gain_state.h"
 #include "p300_protocol.h"
 #include "p300_tx_control.h"
 #include "p300_tx_group.h"
@@ -82,6 +83,12 @@ typedef struct {
 } active_bias_request_t;
 
 typedef struct {
+    p300_gain_control_request_t request;
+    struct sockaddr_in source;
+    socklen_t source_len;
+} active_gain_request_t;
+
+typedef struct {
     p300_tx_control_request_t request;
     struct sockaddr_in source;
     socklen_t source_len;
@@ -110,6 +117,9 @@ static bool s_self_test_cache_valid;
 static p300_bias_state_t s_bias_state;
 static struct sockaddr_in s_bias_source;
 static socklen_t s_bias_source_len;
+static p300_gain_state_t s_gain_state;
+static struct sockaddr_in s_gain_source;
+static socklen_t s_gain_source_len;
 static p300_tx_control_state_t s_tx_control_state;
 static struct sockaddr_in s_tx_control_source;
 static socklen_t s_tx_control_source_len;
@@ -197,6 +207,7 @@ static void close_tcp_socket(void)
     portENTER_CRITICAL(&s_mux);
     s_stats.connected = 0;
     p300_bias_state_cancel_pending(&s_bias_state);
+    p300_gain_state_cancel_pending(&s_gain_state);
     p300_tx_control_state_cancel_pending(&s_tx_control_state);
     portEXIT_CRITICAL(&s_mux);
     if (was_open && eeg_acq_get_config_id() == EEG_ACQ_CONFIG_INTERNAL_SHORT) {
@@ -313,13 +324,13 @@ static bool send_stream_config(void)
 {
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char config[640] = {0};
+    char config[768] = {0};
     const uint8_t tx_group_frames = active_tx_group_frames();
     const int length = snprintf(
         config, sizeof(config),
         "{\"type\":\"STREAM_CONFIG\",\"device_id\":\"P300_%02X%02X%02X%02X%02X%02X\","
-        "\"firmware_version\":\"2.2.0\",\"stream_id\":%" PRIu32 ",\"config_id\":%u,"
-        "\"sample_rate_hz\":%u,\"channel_mask\":255,\"vref_v\":4.5,\"pga_gain\":12,"
+        "\"firmware_version\":\"2.3.0\",\"stream_id\":%" PRIu32 ",\"config_id\":%u,"
+        "\"sample_rate_hz\":%u,\"channel_mask\":255,\"vref_v\":4.5,\"pga_gain\":%u,\"gain_control\":true,\"gain_verified\":%s,"
         "\"reference\":\"ADS1299 internal reference\",\"bias\":\"%s\","
         "\"bias_mask\":%u,\"bias_verified\":%s,\"bias_power_control\":true,"
         "\"marker_codes\":{\"0\":\"none\",\"1\":\"p300\"},\"sync\":\"pc_four_timestamp\","
@@ -327,6 +338,7 @@ static bool send_stream_config(void)
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], s_stream_id,
         (unsigned)eeg_acq_get_config_id(),
         (unsigned)P300_SAMPLE_RATE_HZ,
+        (unsigned)eeg_acq_get_gain(), eeg_acq_gain_is_verified() ? "true" : "false",
         !eeg_acq_normal_bias_is_verified() ? "unknown" :
             (eeg_acq_get_config_id() == EEG_ACQ_CONFIG_NORMAL &&
              eeg_acq_get_normal_bias_mask() != 0U ? "enabled" : "disabled"),
@@ -520,6 +532,23 @@ static p300_bias_control_result_t bias_status_result(
     return result;
 }
 
+static p300_gain_control_result_t gain_status_result(
+    uint32_t request_id,
+    p300_gain_status_t status,
+    uint8_t requested_gain)
+{
+    const bool verified = eeg_acq_gain_is_verified();
+    const p300_gain_control_result_t result = {
+        .request_id = request_id,
+        .status = status,
+        .requested_gain = requested_gain,
+        .actual_gain = verified ? eeg_acq_get_gain() : 0U,
+        .flags = verified ? P300_GAIN_FLAG_VERIFIED : 0U,
+        .stream_id = verified ? s_stream_id : 0U,
+    };
+    return result;
+}
+
 static void send_bias_result(const struct sockaddr_in *source,
                              socklen_t source_len,
                              const p300_bias_control_result_t *result)
@@ -529,6 +558,25 @@ static void send_bias_result(const struct sockaddr_in *source,
     }
     uint8_t packet[P300_BIAS_CONTROL_RESULT_BYTES];
     const size_t length = p300_build_bias_control_result(result, packet, sizeof(packet));
+    const int sent = reply_packet(source, source_len, packet, length);
+    portENTER_CRITICAL(&s_mux);
+    if (sent == (int)length) {
+        s_stats.udp_packets_sent++;
+    } else {
+        s_stats.udp_fail++;
+    }
+    portEXIT_CRITICAL(&s_mux);
+}
+
+static void send_gain_result(const struct sockaddr_in *source,
+                             socklen_t source_len,
+                             const p300_gain_control_result_t *result)
+{
+    if (source == NULL || result == NULL) {
+        return;
+    }
+    uint8_t packet[P300_GAIN_CONTROL_RESULT_BYTES];
+    const size_t length = p300_build_gain_control_result(result, packet, sizeof(packet));
     const int sent = reply_packet(source, source_len, packet, length);
     portENTER_CRITICAL(&s_mux);
     if (sent == (int)length) {
@@ -581,7 +629,8 @@ static bool control_blocks_markers(void)
     bool blocked;
     portENTER_CRITICAL(&s_mux);
     blocked = s_impedance.active || s_self_test.active || s_self_test.pending ||
-              s_bias_state.pending || s_bias_state.active;
+              s_bias_state.pending || s_bias_state.active ||
+              s_gain_state.pending || s_gain_state.active;
     portEXIT_CRITICAL(&s_mux);
     return blocked || s_ads_fault || eeg_acq_is_settling() ||
            eeg_acq_get_config_id() == EEG_ACQ_CONFIG_INTERNAL_SHORT;
@@ -752,7 +801,8 @@ static void handle_bias_control_request(const uint8_t *packet,
         s_bias_state.normal_mask = eeg_acq_get_normal_bias_mask();
         s_bias_state.verified = eeg_acq_normal_bias_is_verified();
     }
-    const bool control_busy = s_impedance.active || s_impedance.pending ||
+    const bool control_busy = s_gain_state.pending || s_gain_state.active ||
+                              s_impedance.active || s_impedance.pending ||
                               s_self_test.active || s_self_test.pending ||
                               s_tx_control_state.pending ||
                               s_tx_control_state.active ||
@@ -768,6 +818,59 @@ static void handle_bias_control_request(const uint8_t *packet,
 
     if (action == P300_BIAS_ACTION_REPLY) {
         send_bias_result(source, source_len, &reply);
+    }
+}
+
+static void handle_gain_control_request(const uint8_t *packet,
+                                        size_t packet_size,
+                                        const struct sockaddr_in *source,
+                                        socklen_t source_len)
+{
+    p300_gain_control_request_t request = {0};
+    const p300_gain_parse_status_t parse_status =
+        p300_parse_gain_control_request(packet, packet_size, &request);
+    if (parse_status == P300_GAIN_PARSE_DROP) {
+        return;
+    }
+
+    const bool tcp_authorized = data_connected() && source_is_tcp_target(source);
+    if (parse_status == P300_GAIN_PARSE_INVALID) {
+        const p300_gain_control_result_t invalid = gain_status_result(
+            request.request_id,
+            tcp_authorized ? P300_GAIN_STATUS_INVALID_REQUEST
+                           : P300_GAIN_STATUS_NO_TCP_STREAM,
+            request.requested_gain);
+        send_gain_result(source, source_len, &invalid);
+        return;
+    }
+
+    p300_gain_control_result_t reply = {0};
+    bool cached = false;
+    p300_gain_action_t action;
+    portENTER_CRITICAL(&s_mux);
+    if (!s_gain_state.fault) {
+        s_gain_state.normal_gain = eeg_acq_get_normal_gain();
+        s_gain_state.verified = eeg_acq_gain_is_verified() &&
+            eeg_acq_get_config_id() == EEG_ACQ_CONFIG_NORMAL &&
+            !s_impedance.active && !s_self_test.active;
+    }
+    const bool control_busy = s_bias_state.pending || s_bias_state.active ||
+                              s_impedance.active || s_impedance.pending ||
+                              s_self_test.active || s_self_test.pending ||
+                              s_tx_control_state.pending ||
+                              s_tx_control_state.active ||
+                              eeg_acq_is_settling() ||
+                              eeg_acq_get_config_id() != EEG_ACQ_CONFIG_NORMAL;
+    action = p300_gain_state_handle(&s_gain_state, &request, tcp_authorized,
+                                    control_busy, s_stream_id, &reply, &cached);
+    if (action == P300_GAIN_ACTION_QUEUED || action == P300_GAIN_ACTION_WAIT) {
+        s_gain_source = *source;
+        s_gain_source_len = source_len;
+    }
+    portEXIT_CRITICAL(&s_mux);
+
+    if (action == P300_GAIN_ACTION_REPLY) {
+        send_gain_result(source, source_len, &reply);
     }
 }
 
@@ -803,6 +906,7 @@ static void handle_tx_control_request(const uint8_t *packet,
         s_impedance.active || s_impedance.pending ||
         s_self_test.active || s_self_test.pending ||
         s_bias_state.pending || s_bias_state.active ||
+              s_gain_state.pending || s_gain_state.active ||
         s_ads_fault || eeg_acq_is_settling();
     action = p300_tx_control_state_handle(
         &s_tx_control_state, &request, tcp_authorized, control_busy,
@@ -853,6 +957,7 @@ static void handle_impedance_request(const uint8_t *packet,
         }
     } else if (s_self_test.active || s_self_test.pending || s_ads_fault ||
                s_bias_state.pending || s_bias_state.active ||
+              s_gain_state.pending || s_gain_state.active ||
                s_tx_control_state.pending || s_tx_control_state.active ||
                eeg_acq_is_settling() ||
                eeg_acq_get_config_id() != EEG_ACQ_CONFIG_NORMAL) {
@@ -999,6 +1104,7 @@ static void handle_self_test_request(const uint8_t *packet,
         send_cached = true;
     } else if (s_impedance.active || s_impedance.pending || s_ads_fault ||
                s_bias_state.pending || s_bias_state.active ||
+              s_gain_state.pending || s_gain_state.active ||
                s_tx_control_state.pending || s_tx_control_state.active ||
                eeg_acq_is_settling()) {
         immediate = self_test_status_result(
@@ -1043,9 +1149,27 @@ static bool take_bias_request(active_bias_request_t *request)
     if (!s_impedance.active && !s_impedance.pending &&
         !s_self_test.active && !s_self_test.pending && !s_ads_fault &&
         !s_tx_control_state.pending && !s_tx_control_state.active &&
+        !s_gain_state.pending && !s_gain_state.active &&
         p300_bias_state_take_pending(&s_bias_state, &request->request)) {
         request->source = s_bias_source;
         request->source_len = s_bias_source_len;
+        ready = true;
+    }
+    portEXIT_CRITICAL(&s_mux);
+    return ready;
+}
+
+static bool take_gain_request(active_gain_request_t *request)
+{
+    bool ready = false;
+    portENTER_CRITICAL(&s_mux);
+    if (!s_impedance.active && !s_impedance.pending &&
+        !s_self_test.active && !s_self_test.pending && !s_ads_fault &&
+        !s_tx_control_state.pending && !s_tx_control_state.active &&
+        !s_bias_state.pending && !s_bias_state.active &&
+        p300_gain_state_take_pending(&s_gain_state, &request->request)) {
+        request->source = s_gain_source;
+        request->source_len = s_gain_source_len;
         ready = true;
     }
     portEXIT_CRITICAL(&s_mux);
@@ -1059,6 +1183,7 @@ static bool take_tx_control_request(active_tx_request_t *request)
     if (!s_impedance.active && !s_impedance.pending &&
         !s_self_test.active && !s_self_test.pending &&
         !s_bias_state.pending && !s_bias_state.active &&
+        !s_gain_state.pending && !s_gain_state.active &&
         !s_ads_fault &&
         p300_tx_control_state_take_pending(&s_tx_control_state,
                                             &request->request)) {
@@ -1146,6 +1271,44 @@ static void run_and_complete_bias_request(const active_bias_request_t *request)
     }
 }
 
+static void run_and_complete_gain_request(const active_gain_request_t *request)
+{
+    const eeg_acq_gain_switch_status_t switch_status =
+        eeg_acq_set_normal_gain(request->request.requested_gain);
+    const p300_gain_status_t status = (p300_gain_status_t)switch_status;
+    if (status == P300_GAIN_STATUS_OK || status == P300_GAIN_STATUS_APPLY_FAILED) {
+        renew_stream_id();
+    }
+
+    const bool verified = status != P300_GAIN_STATUS_RESTORE_FAILED &&
+                          eeg_acq_gain_is_verified();
+    p300_gain_control_result_t result = {0};
+    portENTER_CRITICAL(&s_mux);
+    p300_gain_state_complete(&s_gain_state, status,
+                             eeg_acq_get_normal_gain(),
+                             status == P300_GAIN_STATUS_RESTORE_FAILED ? 0U : s_stream_id,
+                             verified, &result);
+    if (status == P300_GAIN_STATUS_RESTORE_FAILED) {
+        s_ads_fault = true;
+        s_fault_recovery_exhausted = true;
+    }
+    portEXIT_CRITICAL(&s_mux);
+
+    send_gain_result(&request->source, request->source_len, &result);
+    if (status == P300_GAIN_STATUS_OK || status == P300_GAIN_STATUS_APPLY_FAILED) {
+        /* TCP STREAM_CONFIG is connection-scoped; reconnect to publish the new
+         * verified gain and scale before any next segment. USB uses typed CONFIG. */
+        if (s_wifi_mode) {
+            close_tcp_socket();
+        } else {
+            s_serial_connected = false;
+        }
+    } else if (status == P300_GAIN_STATUS_RESTORE_FAILED) {
+        s_serial_connected = false;
+        close_tcp_socket();
+    }
+}
+
 static p300_self_test_status_t map_mode_switch_status(
     eeg_acq_mode_switch_status_t status)
 {
@@ -1177,6 +1340,7 @@ static bool recover_normal_config(void)
             s_ads_fault = false;
             s_fault_recovery_exhausted = false;
             portENTER_CRITICAL(&s_mux);
+            p300_gain_state_clear_fault(&s_gain_state, eeg_acq_get_normal_gain(), eeg_acq_gain_is_verified());
             p300_bias_state_clear_fault(&s_bias_state,
                                         eeg_acq_get_normal_bias_mask(), true);
             portEXIT_CRITICAL(&s_mux);
@@ -1228,6 +1392,18 @@ static void complete_self_test_request(const pending_self_test_t *request,
     s_self_test.active = false;
     portEXIT_CRITICAL(&s_mux);
     send_self_test_result(&request->source, request->source_len, result, false);
+    if (result->status == P300_SELF_TEST_STATUS_OK ||
+        result->status == P300_SELF_TEST_STATUS_CONFIG_FAILED) {
+        /* The diagnostic gain is 12 even when NORMAL uses another gain.
+         * Publish that scale before any diagnostic samples. This reconnect is
+         * intentional and must not undo the requested INTERNAL_SHORT mode. */
+        if (s_wifi_mode) {
+            close_tcp_socket();
+            s_restore_normal_requested = false;
+        } else {
+            s_serial_connected = false;
+        }
+    }
 }
 
 static void restore_normal_after_disconnect(void)
@@ -1273,13 +1449,14 @@ static void dispatch_control(const uint8_t *packet, size_t received,
                 s_clock_last_update_us=esp_timer_get_time();
             portEXIT_CRITICAL(&s_mux);
         }
-    } else if (packet[3]==14 && received==28 && p300_crc32c(packet,24)==read_u32_be(packet+24)) {
+    } else if (packet[3]==P300_UDP_TYPE_TIME_ANCHOR && received==28 && p300_crc32c(packet,24)==read_u32_be(packet+24)) {
         p300_stream_set_unix_time(read_u64_be(packet+8),read_u64_be(packet+16));
     } else if (packet[3]==P300_UDP_TYPE_MARKER) {
         p300_marker_event_t event={0};
         if (p300_parse_marker_packet(packet,received,&event)) enqueue_marker(&event,source,source_len);
     } else if (packet[3]==P300_UDP_TYPE_IMPEDANCE_REQUEST) handle_impedance_request(packet,received,source,source_len);
     else if (packet[3]==P300_UDP_TYPE_SELF_TEST_REQUEST) handle_self_test_request(packet,received,source,source_len);
+    else if (packet[3]==P300_UDP_TYPE_GAIN_CONTROL_REQUEST) handle_gain_control_request(packet,received,source,source_len);
     else if (packet[3]==P300_UDP_TYPE_BIAS_CONTROL_REQUEST) handle_bias_control_request(packet,received,source,source_len);
     else if (packet[3]==P300_UDP_TYPE_TX_CONTROL_REQUEST) handle_tx_control_request(packet,received,source,source_len);
 }
@@ -1425,6 +1602,14 @@ static void stream_task(void *arg)
             memset(&building, 0, sizeof(building));
             continue;
         }
+        active_gain_request_t gain_request = {0};
+        if (building_count == 0U && take_gain_request(&gain_request)) {
+            flush_tx_group();
+            clear_batch_fifo();
+            run_and_complete_gain_request(&gain_request);
+            memset(&building, 0, sizeof(building));
+            continue;
+        }
         active_bias_request_t bias_request = {0};
         if (building_count == 0U && take_bias_request(&bias_request)) {
             flush_tx_group();
@@ -1493,6 +1678,7 @@ esp_err_t p300_stream_start(void)
     s_restore_normal_requested = false;
     s_ads_fault = false;
     s_fault_recovery_exhausted = false;
+    p300_gain_state_init(&s_gain_state, eeg_acq_get_normal_gain(), eeg_acq_gain_is_verified());
     p300_bias_state_init(&s_bias_state,
                          eeg_acq_get_normal_bias_mask(),
                          eeg_acq_normal_bias_is_verified());
@@ -1554,7 +1740,7 @@ esp_err_t p300_stream_set_mode(bool wifi)
     if (wifi==s_wifi_mode) return ESP_OK;
     portENTER_CRITICAL(&s_mux);
     bool busy=s_requested_mode>=0 || s_impedance.active || s_impedance.pending ||
-        s_self_test.active || s_self_test.pending || s_bias_state.active || s_bias_state.pending;
+        s_self_test.active || s_self_test.pending || s_bias_state.active || s_bias_state.pending || s_gain_state.active || s_gain_state.pending;
     if (!busy) s_requested_mode=wifi?1:0;
     portEXIT_CRITICAL(&s_mux);
     if (busy) return ESP_ERR_INVALID_STATE;
@@ -1576,7 +1762,7 @@ esp_err_t p300_stream_restart(void)
     if (!s_stream_task) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&s_mux);
     bool busy=s_requested_mode>=0 || s_impedance.active || s_impedance.pending ||
-        s_self_test.active || s_self_test.pending || s_bias_state.active || s_bias_state.pending;
+        s_self_test.active || s_self_test.pending || s_bias_state.active || s_bias_state.pending || s_gain_state.active || s_gain_state.pending;
     if (!busy) s_requested_mode=s_wifi_mode?1:0;
     portEXIT_CRITICAL(&s_mux);
     if (busy) return ESP_ERR_INVALID_STATE;

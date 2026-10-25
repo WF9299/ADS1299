@@ -171,6 +171,7 @@ class HttpPacketAggregator:
         if target_samples <= 0 or target_samples % HTTP_INPUT_BATCH_SAMPLES:
             raise ValueError("target_samples must be a positive multiple of 20")
         self.target_samples = int(target_samples)
+        self._scale = None
         self._stream_id: int | None = None
         self._next_seq: int | None = None
         self._sampling_rate: int | None = None
@@ -185,6 +186,7 @@ class HttpPacketAggregator:
         return len(self._data)
 
     def reset(self) -> None:
+        self._scale = None
         self._stream_id = None
         self._next_seq = None
         self._sampling_rate = None
@@ -227,6 +229,10 @@ class HttpPacketAggregator:
         return normalized_data, normalized_markers, sampling_rate, channels, device, timestamp
 
     def ingest(self, batch: EegBatch, record: dict) -> dict | None:
+        scale = (record.get("vref_v"), record.get("pga_gain"))
+        if self._scale is not None and scale != self._scale:
+            self.reset()
+        self._scale = scale
         if batch.config_id != CONFIG_NORMAL:
             self.reset()
             return None
@@ -250,6 +256,7 @@ class HttpPacketAggregator:
         if not continuous:
             self.reset()
 
+        self._scale = scale
         if self._stream_id is None:
             self._stream_id = stream_id
             self._sampling_rate = sampling_rate

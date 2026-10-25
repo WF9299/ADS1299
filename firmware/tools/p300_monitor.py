@@ -79,6 +79,7 @@ from tools.p300_signal_quality import (
 )
 from tools.p300_serial import SerialReceiver
 from tools.p300_discovery import DiscoveryServer
+from tools.p300_gain import GAINS, GainControlClient, GainResultData, GainSetOutcome, GainStatus
 from tools.p300_tx_control import TxControlClient, TxResultData, TxSetOutcome, TxStatus
 
 try:
@@ -147,7 +148,16 @@ class MonitorDataModel:
         return int(self.config.get("sampling_rate", self.config.get("sample_rate_hz", 1000)))
 
     def set_config(self, config: dict) -> None:
-        self.config = {**self.config, **config}
+        old_scale = (self.config.get("vref_v", 4.5), self.config.get("pga_gain", 12.0))
+        new_scale = (config.get("vref_v", 4.5), config.get("pga_gain", 12.0))
+        if old_scale != new_scale:
+            self._times.clear()
+            self._values.clear()
+            self.marker_events.clear()
+            self.last_marker_code = 0
+            self.last_record = None
+        self.config = {**self.config, **config, "vref_v": new_scale[0], "pga_gain": new_scale[1]}
+        self.config["sampling_rate"] = int(config.get("sampling_rate", config.get("sample_rate_hz", self.sampling_rate)))
         self.config["sampling_rate"] = max(1, self.sampling_rate)
         self._resize_history()
 
@@ -428,6 +438,15 @@ if QtWidgets is not None:
             self.http_sender: HttpJsonSender | None = None
             self.impedance_client: ImpedanceClient | None = None
             self.self_test_client: SelfTestClient | None = None
+            self.gain_client: GainControlClient | None = None
+            self.gain_pending = False
+            self.gain_last_request_id = None
+            self.gain_wait_config = None
+            self.gain_deadline = 0.0
+            self.gain_actual = None
+            self.gain_supported = False
+            self.gain_notice = ""
+            self._scale_context = None
             self.bias_client: BiasControlClient | None = None
             self.bias_actual_mask: int | None = None
             self.bias_power_supported: bool | None = None
@@ -1097,7 +1116,7 @@ if QtWidgets is not None:
                 self._start_http_push()
 
         def _start_http_push(self) -> None:
-            if self.self_test_active or self.self_test_pending or self.bias_pending:
+            if self.self_test_active or self.self_test_pending or self.bias_pending or self.gain_pending:
                 return
             try:
                 settings = HttpPushSettings(
@@ -1122,6 +1141,7 @@ if QtWidgets is not None:
             self.http_button.setText("停止 HTTP 推送")
             self._update_http_controls()
             self._refresh_http_status()
+            self._update_gain_controls()
 
         def _stop_http_push(self) -> None:
             self.http_aggregator.reset()
@@ -1137,6 +1157,7 @@ if QtWidgets is not None:
             self.http_button.setText("开始 HTTP 推送")
             self._update_http_controls()
             self._refresh_http_status()
+            self._update_gain_controls()
 
         def _submit_http_batch(self, batch: EegBatch, record: dict) -> None:
             if self.http_sender is None:
@@ -1147,9 +1168,9 @@ if QtWidgets is not None:
             payload = self.http_aggregator.ingest(batch, record)
             if payload is not None:
                 payload["units"] = "uV"
-                if "vref_v" in self.model.config and "pga_gain" in self.model.config:
-                    payload["vref_v"] = self.model.config["vref_v"]
-                    payload["pga_gain"] = self.model.config["pga_gain"]
+                if "vref_v" in record and "pga_gain" in record:
+                    payload["vref_v"] = record["vref_v"]
+                    payload["pga_gain"] = record["pga_gain"]
                 for key in ("bias", "bias_mask", "bias_verified"):
                     if key in record:
                         payload[key] = record[key]
@@ -1157,7 +1178,7 @@ if QtWidgets is not None:
 
         def _update_http_controls(self) -> None:
             active = self.http_sender is not None
-            blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.tx_pending
+            blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.gain_pending or self.tx_pending
             special = self.http_channel_mode_combo.currentData() == HTTP_CHANNEL_MODE_SIX
             source7, source8 = self.http_channel7_combo.currentData(), self.http_channel8_combo.currentData()
             mapping_valid = not special or source7 != source8
@@ -1350,6 +1371,7 @@ if QtWidgets is not None:
 
         def _stop_receiver(self) -> None:
             self.active_receiver_epoch = None
+            self._stop_gain_client()
             self._stop_bias_client()
             if self.tx_client is not None:
                 self.tx_client.stop()
@@ -1415,7 +1437,7 @@ if QtWidgets is not None:
 
         def _update_tx_control(self) -> None:
             enabled = (self.connected and self.has_valid_eeg and self.peer_ip is not None
-                and not self.tx_pending and not self.bias_pending and not self.self_test_pending
+                and not self.tx_pending and not self.bias_pending and not self.gain_pending and not self.self_test_pending
                 and not self.impedance_active and not self.restore_failed
                 and self.writer is None and self.http_sender is None)
             self.tx_control_button.setEnabled(enabled)
@@ -1636,6 +1658,174 @@ if QtWidgets is not None:
             self.http_aggregator.reset()
             self._refresh_diagnostics()
 
+        def _build_gain_group(self):
+            group = QtWidgets.QGroupBox("ADS1299 硬件增益（统一8路）")
+            layout = QtWidgets.QGridLayout(group)
+            self.gain_combo = QtWidgets.QComboBox()
+            for gain in GAINS:
+                self.gain_combo.addItem(f"{gain} 倍", gain)
+            self.gain_combo.setCurrentIndex(GAINS.index(12))
+            self.gain_query_button = QtWidgets.QPushButton("查询实际")
+            self.gain_apply_button = QtWidgets.QPushButton("应用增益")
+            self.gain_query_button.clicked.connect(lambda: self._start_gain_control(False))
+            self.gain_apply_button.clicked.connect(lambda: self._start_gain_control(True))
+            self.gain_actual_label = QtWidgets.QLabel("设备实际：未知")
+            self.gain_status = QtWidgets.QLabel("先连接设备；修改前停止记录和 HTTP。板子重启恢复12倍。")
+            self.gain_actual_label.setWordWrap(True)
+            self.gain_status.setWordWrap(True)
+            layout.addWidget(QtWidgets.QLabel("待应用"), 0, 0)
+            layout.addWidget(self.gain_combo, 0, 1)
+            layout.addWidget(self.gain_query_button, 0, 2)
+            layout.addWidget(self.gain_apply_button, 0, 3)
+            layout.addWidget(self.gain_actual_label, 1, 0, 1, 4)
+            layout.addWidget(self.gain_status, 2, 0, 1, 4)
+            self._update_gain_controls()
+            return group
+
+        def _update_gain_controls(self):
+            if not hasattr(self, "gain_apply_button"):
+                return
+            if self.gain_wait_config and time.monotonic() > self.gain_deadline:
+                self.gain_wait_config = None
+                self.gain_pending = False
+                self.gain_actual = None
+                self.gain_actual_label.setText("设备实际：未知（未收到匹配的数据配置）")
+                self.gain_status.setText("等待新数据配置超时，请重新查询或连接。")
+            safe = (self.connected and self.peer_ip is not None and self.gain_supported
+                and not self.gain_pending and not self.bias_pending and not self.tx_pending
+                and not self.self_test_active and not self.self_test_pending
+                and not self.impedance_active and not self.restore_failed)
+            self.gain_query_button.setEnabled(safe)
+            self.gain_combo.setEnabled(not self.gain_pending)
+            self.gain_apply_button.setEnabled(safe and self.has_valid_eeg
+                and self.gain_actual is not None and self.writer is None and self.http_sender is None)
+
+        def _stop_gain_client(self):
+            if self.gain_client is not None:
+                self.gain_client.stop()
+                self.gain_client.join(timeout=1)
+                self.gain_client = None
+            self.gain_pending = False
+            self.gain_wait_config = None
+            self.gain_last_request_id = None
+            self.gain_actual = None
+            self.gain_supported = False
+            if hasattr(self, "gain_actual_label"):
+                self.gain_actual_label.setText("设备实际：未知")
+
+        def _start_gain_control(self, apply):
+            self._update_gain_controls()
+            button = self.gain_apply_button if apply else self.gain_query_button
+            if not button.isEnabled():
+                return
+            if self.gain_client is not None:
+                self.gain_client.stop()
+                self.gain_client.join(timeout=1)
+            try:
+                self.gain_client = GainControlClient(self.peer_ip, DEFAULT_BIAS_PORT,
+                    timeout_s=0.6, retries=2, events=self.events, exchange=self._control_exchange())
+                self.gain_last_request_id = (self.gain_client.start_set(self.gain_combo.currentData())
+                    if apply else self.gain_client.start_query())
+            except (OSError, ValueError, RuntimeError) as error:
+                self.gain_status.setText(f"增益控制启动失败：{error}")
+                return
+            self.gain_pending = True
+            self.gain_wait_config = None
+            self.gain_notice = ""
+            self.gain_status.setText("正在写入并回读增益…" if apply else "正在查询设备增益…")
+            self._update_gain_controls()
+            self._update_bias_controls()
+            self._update_tx_control()
+            self._update_impedance_button()
+            self._update_self_test_button()
+            self._update_record_controls()
+
+        def _gain_config_matches(self, stream_id, gain):
+            return (self.connected and self.model.config.get("gain_verified") is True
+                and self.model.config.get("stream_id") == stream_id
+                and self.model.config.get("pga_gain") == gain)
+
+        def _handle_gain_event(self, event):
+            if event.get("request_id") != self.gain_last_request_id or event.get("state") == "started":
+                return
+            self.gain_pending = False
+            self.gain_last_request_id = None
+            payload = event.get("result")
+            outcome = payload if isinstance(payload, GainSetOutcome) else None
+            result = outcome.result if outcome is not None else payload
+            if event.get("state") != "result" or not isinstance(result, GainResultData):
+                self.gain_actual = None
+                self.gain_actual_label.setText("设备实际：未知")
+                self.gain_status.setText(f"增益控制未确认：{event.get('message', '无效回复')}；请重新查询。")
+            elif result.verified and result.status in (GainStatus.OK, GainStatus.APPLY_FAILED):
+                self.gain_actual = result.actual_gain
+                self.gain_actual_label.setText(f"寄存器回读：{result.actual_gain} 倍（VERIFIED）")
+                if result.status == GainStatus.APPLY_FAILED:
+                    message = f"应用失败，已回滚到 {result.actual_gain} 倍。"
+                elif outcome is not None and not outcome.applied:
+                    message = f"目标增益未确认，设备回读为 {result.actual_gain} 倍。"
+                else:
+                    message = f"设备确认 {result.actual_gain} 倍。"
+                self.gain_notice = message
+                if not self._gain_config_matches(result.stream_id, result.actual_gain):
+                    self.gain_pending = True
+                    self.gain_wait_config = (result.stream_id, result.actual_gain)
+                    self.gain_deadline = time.monotonic() + 6.0
+                    message += " 等待对应的新数据配置。"
+                else:
+                    message += " 数据量程已同步。"
+                self.gain_status.setText(message)
+            else:
+                self.gain_actual = None
+                self.gain_actual_label.setText("设备实际：未知")
+                self.gain_status.setText(f"增益操作未完成：{result.status.name}；请重新查询。")
+                if result.status == GainStatus.RESTORE_FAILED:
+                    self.restore_failed = True
+                    self._set_state("error", "增益回滚失败，设备采集已暂停")
+            self._update_gain_controls()
+            self._update_impedance_button()
+            self._update_self_test_button()
+            self._update_record_controls()
+            self._update_tx_control()
+
+        def _apply_stream_config(self, config):
+            scale = (float(config.get("vref_v", 4.5)), float(config.get("pga_gain", 12.0)))
+            if self._scale_context is not None and scale != self._scale_context:
+                self.http_aggregator.reset()
+                self.display_filter.reset("gain-change")
+                self.quality_analyzer.reset("gain-change")
+                self.display_quality_analyzer.reset("gain-change")
+                self._last_quality_snapshot = self._last_display_quality_snapshot = None
+                self.self_test_analyzer.reset()
+                self._clear_marker_lines()
+                stopped = self.writer is not None or self.http_sender is not None
+                if self.writer is not None:
+                    self._toggle_recording()
+                    self.record_status.setText("记录：设备量程变化，已结束当前记录；可重新开始。")
+                if self.http_sender is not None:
+                    self._stop_http_push()
+                    self.http_detail.setText("设备量程变化，已停止推送并清除旧聚合；可重新开始。")
+                if stopped:
+                    self.gain_notice = "设备量程变化，记录/HTTP已停止，请重新开始。"
+                    self.gain_status.setText(self.gain_notice)
+            self._scale_context = scale
+            for key in ("gain_control", "gain_verified"):
+                self.model.config.pop(key, None)
+            self.model.set_config(config)
+            self.gain_supported = config.get("gain_control") is True
+            verified = config.get("gain_verified") is True and scale[1] in GAINS
+            self.gain_actual = int(scale[1]) if verified else None
+            self.gain_actual_label.setText(f"设备实际：{int(scale[1])} 倍（数据配置已验证）" if verified else "设备实际：未知（未验证）")
+            if not self.gain_supported:
+                self.gain_status.setText("当前固件不支持增益控制，请升级到2.3.0；EEG仍可正常接收。")
+            elif self.gain_wait_config and self._gain_config_matches(*self.gain_wait_config):
+                self.gain_pending = False
+                self.gain_wait_config = None
+                self.gain_status.setText(self.gain_notice + " 数据量程已同步。")
+            elif not self.gain_pending and not self.gain_notice and verified:
+                self.gain_status.setText("修改前停止记录和 HTTP；应用后自动恢复采集。板子重启恢复12倍。")
+            self._update_gain_controls()
+
         def _ensure_bias_client(self) -> BiasControlClient:
             if not self.peer_ip:
                 raise RuntimeError("没有可用的ESP32 TCP对端地址")
@@ -1714,7 +1904,7 @@ if QtWidgets is not None:
             self.bias_status.setStyleSheet("color:#d9a441")
 
         def _query_bias_mask(self) -> None:
-            if not self.connected or not self.peer_ip or self.bias_pending:
+            if not self.connected or not self.peer_ip or self.bias_pending or self.gain_pending:
                 return
             try:
                 request_id = self._ensure_bias_client().start_query()
@@ -1858,7 +2048,7 @@ if QtWidgets is not None:
             if not hasattr(self, "bias_query_button"):
                 return
             safe = (
-                self.connected and self.peer_ip is not None and not self.bias_pending
+                self.connected and self.peer_ip is not None and not self.bias_pending and not self.gain_pending
                 and not self.impedance_active and not self.self_test_active
                 and not self.self_test_pending and not self.restore_failed
                 and not self.tx_pending
@@ -2013,6 +2203,11 @@ if QtWidgets is not None:
                         self.restore_failed = False
                         self.remote_label.setText(f"远端：{self.peer_ip}:{self.peer_port}")
                     else:
+                        self.gain_actual = None
+                        self.gain_supported = False
+                        self.gain_actual_label.setText("设备实际：未知（连接断开）")
+                        if not self.gain_pending:
+                            self._stop_gain_client()
                         self._stop_bias_client()
                         self.display_filter.reset("disconnect")
                         self.quality_analyzer.reset("disconnect")
@@ -2039,12 +2234,12 @@ if QtWidgets is not None:
                 elif kind == "config":
                     for key in ("bias", "bias_mask", "bias_verified", "bias_power_control"):
                         self.model.config.pop(key, None)
-                    self.model.set_config(event[1])
+                    self._apply_stream_config(event[1])
                     self._set_tx_provisional_from_config()
                     device = event[1].get("device", event[1].get("device_id", "ESP32-C5-ADS1299"))
                     self.device_label.setText(f"设备：{device}")
                 elif kind == "batch":
-                    self.model.set_config(event[1])
+                    self._apply_stream_config(event[1])
                     raw_batch = event[2]
                     batch = apply_marker_override(raw_batch, self.force_markers_enabled)
                     record = batch_to_record(batch, self.model.config)
@@ -2096,6 +2291,8 @@ if QtWidgets is not None:
                     self._handle_self_test_event(event[1])
                 elif kind == "bias":
                     self._handle_bias_event(event[1])
+                elif kind == "gain":
+                    self._handle_gain_event(event[1])
                 elif kind == "tx_control":
                     self._handle_tx_control_event(event[1])
             if changed and not self.impedance_active:
@@ -2217,6 +2414,7 @@ if QtWidgets is not None:
                     )
             self._refresh_http_status()
             self._update_tx_control()
+            self._update_gain_controls()
 
         def _update_impedance_button(self) -> None:
             enabled = (
@@ -2224,7 +2422,7 @@ if QtWidgets is not None:
                 and not self.impedance_active and not self.restore_failed
                 and not self.self_test_active and not self.self_test_pending
                 and not self.tx_pending
-                and not self.bias_pending
+                and not self.bias_pending and not self.gain_pending
             )
             self.impedance_button.setEnabled(enabled)
 
@@ -2270,13 +2468,13 @@ if QtWidgets is not None:
                 and not self.impedance_active
                 and not self.self_test_pending
                 and not self.restore_failed
-                and not self.bias_pending
+                and not self.bias_pending and not self.gain_pending
                 and not self.tx_pending
             )
             self.self_test_button.setEnabled(enabled)
 
         def _update_record_controls(self) -> None:
-            blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.tx_pending
+            blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.gain_pending or self.tx_pending
             self.record_button.setEnabled(self.writer is not None or not blocked)
             self.export_json_button.setEnabled(not blocked)
             self.export_csv_button.setEnabled(not blocked)
@@ -2286,6 +2484,7 @@ if QtWidgets is not None:
                 )
             self._update_http_controls()
             self._update_bias_controls()
+            self._update_gain_controls()
 
         def _toggle_self_test(self) -> None:
             if not self.peer_ip or not self.self_test_button.isEnabled():
@@ -2540,7 +2739,7 @@ if QtWidgets is not None:
                 self.record_button.setText("开始 JSONL 记录")
                 self._update_record_controls()
                 return
-            if self.self_test_active or self.self_test_pending or self.bias_pending:
+            if self.self_test_active or self.self_test_pending or self.bias_pending or self.gain_pending:
                 return
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "保存JSONL", "capture.jsonl", "JSON Lines (*.jsonl)"

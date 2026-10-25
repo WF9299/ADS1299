@@ -37,6 +37,10 @@ esp_err_t ads1299_apply_verified_reference_config_with_bias(uint8_t bias_mask);
 /* Normal BIAS state: nonzero enables the buffer with selected P inputs;
  * zero powers down the buffer. Both CONFIG3 and sense registers are verified. */
 esp_err_t ads1299_set_bias_sensp_verified(uint8_t bias_mask);
+esp_err_t ads1299_gain_bits(uint8_t gain, uint8_t *bits);
+/* Caller must pause acquisition; on failure caller must restore or halt. */
+esp_err_t ads1299_set_gain_verified(uint8_t gain);
+esp_err_t ads1299_apply_normal_config(uint8_t bias_mask, uint8_t gain);
 esp_err_t ads1299_apply_internal_test_config(void);
 esp_err_t ads1299_apply_internal_short_config(void);
 esp_err_t ads1299_measure_leadoff(ads1299_leadoff_result_t *result);

@@ -247,7 +247,8 @@ class P300ToolProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(float(converted[1]), 375_000.0, places=3)
 
         record = batch_to_record(self.make_batch(), {"device": "BrainCo-Simulator", "eeg_type": 1})
-        self.assertEqual(list(record), ["data", "timestamp", "sampling_rate", "channels", "device", "batch", "markers", "eeg_type"])
+        self.assertEqual(list(record), ["data", "timestamp", "sampling_rate", "channels", "device", "batch", "markers", "eeg_type", "units", "vref_v", "pga_gain"])
+        self.assertEqual((record["units"], record["vref_v"], record["pga_gain"]), ("uV", 4.5, 12.0))
         self.assertEqual(len(record["data"]), 20)
         self.assertEqual(len(record["data"][0]), 8)
         self.assertEqual(record["markers"][3], 1)

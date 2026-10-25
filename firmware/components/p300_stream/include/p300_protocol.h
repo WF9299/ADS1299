@@ -46,6 +46,9 @@ typedef enum {
     P300_UDP_TYPE_BIAS_CONTROL_RESULT = 11,
     P300_UDP_TYPE_TX_CONTROL_REQUEST = 12,
     P300_UDP_TYPE_TX_CONTROL_RESULT = 13,
+    P300_UDP_TYPE_TIME_ANCHOR = 14,
+    P300_UDP_TYPE_GAIN_CONTROL_REQUEST = 16,
+    P300_UDP_TYPE_GAIN_CONTROL_RESULT = 17,
 } p300_udp_type_t;
 
 typedef enum {
@@ -250,6 +253,38 @@ typedef struct {
     uint64_t t3_esp_us;
     uint64_t t4_pc_us;
 } p300_sync_measurement_t;
+
+#define P300_GAIN_CONTROL_REQUEST_BYTES 16U
+#define P300_GAIN_CONTROL_RESULT_BYTES 20U
+typedef enum { P300_GAIN_OPERATION_QUERY = 0, P300_GAIN_OPERATION_SET = 1 } p300_gain_operation_t;
+typedef enum {
+    P300_GAIN_STATUS_OK = 0, P300_GAIN_STATUS_BUSY = 1,
+    P300_GAIN_STATUS_INVALID_REQUEST = 2, P300_GAIN_STATUS_NO_TCP_STREAM = 3,
+    P300_GAIN_STATUS_APPLY_FAILED = 4, P300_GAIN_STATUS_RESTORE_FAILED = 5,
+    P300_GAIN_STATUS_INTERNAL_ERROR = 6,
+} p300_gain_status_t;
+typedef enum { P300_GAIN_PARSE_DROP = 0, P300_GAIN_PARSE_INVALID = 1,
+               P300_GAIN_PARSE_OK = 2 } p300_gain_parse_status_t;
+enum { P300_GAIN_FLAG_CHANGED = 1U << 0, P300_GAIN_FLAG_CACHED = 1U << 1,
+       P300_GAIN_FLAG_VERIFIED = 1U << 2 };
+typedef struct {
+    uint32_t request_id;
+    p300_gain_operation_t operation;
+    uint8_t requested_gain;
+} p300_gain_control_request_t;
+typedef struct {
+    uint32_t request_id;
+    p300_gain_status_t status;
+    uint8_t requested_gain;
+    uint8_t actual_gain;
+    uint8_t flags;
+    uint32_t stream_id;
+} p300_gain_control_result_t;
+bool p300_gain_valid(uint8_t gain);
+p300_gain_parse_status_t p300_parse_gain_control_request(
+    const uint8_t *packet, size_t packet_size, p300_gain_control_request_t *request);
+size_t p300_build_gain_control_result(const p300_gain_control_result_t *result,
+                                      uint8_t *packet, size_t packet_size);
 
 uint32_t p300_crc32c(const uint8_t *data, size_t len);
 size_t p300_encode_eeg_batch(uint32_t stream_id,
