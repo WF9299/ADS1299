@@ -35,10 +35,13 @@ from tools.p300_impedance import (
     build_impedance_report,
 )
 from tools.p300_http_push import (
+    HTTP_CHANNEL_MODES,
+    HTTP_CHANNEL_MODE_SIX,
     HTTP_PUSH_PRESETS,
     HttpJsonSender,
     HttpPacketAggregator,
     HttpPushSettings,
+    map_http_channels,
 )
 from tools.p300_filters import (
     FILTER_MODE_LABELS,
@@ -668,7 +671,10 @@ if QtWidgets is not None:
             self.tabs.addTab(self._build_fft_tab(), "频谱")
             self.tabs.addTab(self._build_impedance_tab(), "阻抗")
             self.tabs.addTab(self._build_self_test_tab(), "内部短接")
-            self.tabs.addTab(self._build_record_tab(), "记录")
+            record_scroll = QtWidgets.QScrollArea()
+            record_scroll.setWidgetResizable(True)
+            record_scroll.setWidget(self._build_record_tab())
+            self.tabs.addTab(record_scroll, "记录")
             self.tabs.addTab(self._build_quality_tab(), "质量")
             from tools.p300_connection_ui import ConnectionPanel
             self.network_panel = ConnectionPanel(self)
@@ -686,10 +692,16 @@ if QtWidgets is not None:
             self.fft_channel = QtWidgets.QComboBox()
             self.fft_channel.addItems([f"CH{index + 1}" for index in range(CHANNELS)])
             row.addWidget(self.fft_channel)
+            row.addWidget(QtWidgets.QLabel("范围"))
+            self.fft_range_combo = QtWidgets.QComboBox()
+            for maximum in (60, 120):
+                self.fft_range_combo.addItem(f"0–{maximum} Hz", maximum)
+            self.fft_range_combo.setToolTip("切换频谱显示和主峰搜索范围；滤波带宽保持当前设置。")
+            row.addWidget(self.fft_range_combo)
             self.fft_peak = QtWidgets.QLabel("主峰：--")
-            row.addWidget(self.fft_peak)
             row.addStretch(1)
             layout.addLayout(row)
+            layout.addWidget(self.fft_peak)
             self.spectrum = pg.PlotWidget(title="0–60 Hz FFT")
             self.spectrum.setTitle("0–60 Hz FFT", size="12pt")
             self.spectrum.setLabel(
@@ -705,6 +717,9 @@ if QtWidgets is not None:
             self.spectrum.getAxis("left").setTickFont(spectrum_font)
             self.spectrum.showGrid(x=True, y=True, alpha=0.25)
             self.spectrum_curve = self.spectrum.plot(pen=pg.mkPen("#f0bc3d", width=2))
+            self.spectrum.setXRange(0.0, 60.0, padding=0.0)
+            self.fft_range_combo.currentIndexChanged.connect(lambda _index: self._refresh_spectrum())
+            self.fft_channel.currentIndexChanged.connect(lambda _index: self._refresh_spectrum())
             layout.addWidget(self.spectrum, 1)
             self.latest_values = QtWidgets.QLabel("CH1–CH8：--")
             self.latest_values.setWordWrap(True)
@@ -874,6 +889,7 @@ if QtWidgets is not None:
             self.reset_stats_button.clicked.connect(self.model.reset_statistics)
 
             http_group = QtWidgets.QGroupBox("HTTP JSON 推送（200点 / 200 ms）")
+            http_group.setStyleSheet("QGroupBox { margin-top: 24px; }")
             http_layout = QtWidgets.QGridLayout(http_group)
             self.http_ip_edit = QtWidgets.QLineEdit(self.http_settings.server_ip)
             self.http_port_edit = QtWidgets.QSpinBox()
@@ -889,6 +905,24 @@ if QtWidgets is not None:
             self.http_ip_edit.textChanged.connect(self._sync_http_preset)
             self.http_port_edit.valueChanged.connect(self._sync_http_preset)
             self._sync_http_preset()
+
+            self.http_channel_mode_combo = QtWidgets.QComboBox()
+            for label, mode in HTTP_CHANNEL_MODES:
+                self.http_channel_mode_combo.addItem(label, mode)
+            self.http_channel_mode_combo.setCurrentIndex(
+                self.http_channel_mode_combo.findData(self.http_settings.channel_mode))
+            self.http_channel7_combo = QtWidgets.QComboBox()
+            self.http_channel8_combo = QtWidgets.QComboBox()
+            for combo, selected in ((self.http_channel7_combo, self.http_settings.channel7_source),
+                                    (self.http_channel8_combo, self.http_settings.channel8_source)):
+                for channel in range(1, 7):
+                    combo.addItem(f"CH{channel}", channel)
+                combo.setCurrentIndex(combo.findData(selected))
+            self.http_channel_summary = QtWidgets.QLabel()
+            self.http_channel_summary.setWordWrap(True)
+            for combo in (self.http_channel_mode_combo, self.http_channel7_combo, self.http_channel8_combo):
+                combo.setToolTip("只改变HTTP输出；推送中锁定，停止后可修改。板端采集和本地原始记录保持8路。")
+                combo.currentIndexChanged.connect(self._http_channel_selection_changed)
 
             self.http_button = QtWidgets.QPushButton("开始 HTTP 推送")
             self.http_button.clicked.connect(self._toggle_http_push)
@@ -906,10 +940,18 @@ if QtWidgets is not None:
             http_layout.addWidget(self.http_port_edit, 1, 3)
             http_layout.addWidget(QtWidgets.QLabel("路径"), 2, 0)
             http_layout.addWidget(self.http_endpoint_edit, 2, 1, 1, 3)
-            http_layout.addWidget(self.http_button, 3, 0, 1, 4)
-            http_layout.addWidget(self.http_status, 4, 0, 1, 4)
-            http_layout.addWidget(self.http_stats, 5, 0, 1, 4)
-            http_layout.addWidget(self.http_detail, 6, 0, 1, 4)
+            http_layout.addWidget(QtWidgets.QLabel("通道模式"), 3, 0)
+            http_layout.addWidget(self.http_channel_mode_combo, 3, 1, 1, 3)
+            http_layout.addWidget(QtWidgets.QLabel("输出CH7来源"), 4, 0)
+            http_layout.addWidget(self.http_channel7_combo, 4, 1)
+            http_layout.addWidget(QtWidgets.QLabel("输出CH8来源"), 4, 2)
+            http_layout.addWidget(self.http_channel8_combo, 4, 3)
+            http_layout.addWidget(self.http_channel_summary, 5, 0, 1, 4)
+            http_layout.addWidget(self.http_button, 6, 0, 1, 4)
+            http_layout.addWidget(self.http_status, 7, 0, 1, 4)
+            http_layout.addWidget(self.http_stats, 8, 0, 1, 4)
+            http_layout.addWidget(self.http_detail, 9, 0, 1, 4)
+            self._update_http_controls()
 
             layout.addWidget(self.record_button)
             layout.addWidget(self.record_status)
@@ -936,7 +978,7 @@ if QtWidgets is not None:
             layout.addLayout(badges)
             self.quality_status = QtWidgets.QLabel(
                 "原始状态用于判断采集链质量；显示50 Hz只验证当前参考/滤波效果；"
-                "记录和HTTP始终保存原始EEG。每500 ms更新。"
+                "记录保存物理8路原始EEG；HTTP按记录页通道模式输出原始值。每500 ms更新。"
             )
             self.quality_status.setWordWrap(True)
             layout.addWidget(self.quality_status)
@@ -1036,6 +1078,18 @@ if QtWidgets is not None:
             self.http_port_edit.blockSignals(port_blocked)
             self._sync_http_preset()
 
+        def _http_channel_selection_changed(self, *_args) -> None:
+            if self.http_sender is not None:
+                # Also protect against programmatic changes while a sender owns
+                # immutable settings; the displayed selection stays truthful.
+                for combo, value in ((self.http_channel_mode_combo, self.http_settings.channel_mode),
+                                     (self.http_channel7_combo, self.http_settings.channel7_source),
+                                     (self.http_channel8_combo, self.http_settings.channel8_source)):
+                    previous = combo.blockSignals(True)
+                    combo.setCurrentIndex(combo.findData(value))
+                    combo.blockSignals(previous)
+            self._update_http_controls()
+
         def _toggle_http_push(self) -> None:
             if self.http_sender is not None:
                 self._stop_http_push()
@@ -1050,6 +1104,9 @@ if QtWidgets is not None:
                     self.http_ip_edit.text(),
                     self.http_port_edit.value(),
                     self.http_endpoint_edit.text(),
+                    self.http_channel_mode_combo.currentData(),
+                    self.http_channel7_combo.currentData(),
+                    self.http_channel8_combo.currentData(),
                 ).normalized()
                 settings.save(self.http_settings_path)
                 sender = HttpJsonSender(settings)
@@ -1096,16 +1153,31 @@ if QtWidgets is not None:
                 for key in ("bias", "bias_mask", "bias_verified"):
                     if key in record:
                         payload[key] = record[key]
-                self.http_sender.submit(payload)
+                self.http_sender.submit(map_http_channels(payload, self.http_settings))
 
         def _update_http_controls(self) -> None:
             active = self.http_sender is not None
             blocked = self.self_test_active or self.self_test_pending or self.bias_pending or self.tx_pending
-            self.http_button.setEnabled(active or not blocked)
+            special = self.http_channel_mode_combo.currentData() == HTTP_CHANNEL_MODE_SIX
+            source7, source8 = self.http_channel7_combo.currentData(), self.http_channel8_combo.currentData()
+            mapping_valid = not special or source7 != source8
+            self.http_button.setEnabled(active or (not blocked and mapping_valid))
             self.http_preset_combo.setEnabled(not active)
             self.http_ip_edit.setEnabled(not active)
             self.http_port_edit.setEnabled(not active)
             self.http_endpoint_edit.setEnabled(not active)
+            self.http_channel_mode_combo.setEnabled(not active)
+            self.http_channel7_combo.setEnabled(not active and special)
+            self.http_channel8_combo.setEnabled(not active and special)
+            if not special:
+                text = "HTTP输出：物理CH1–CH8原始值"
+            elif not mapping_valid:
+                text = "请选择两个不同的来源通道，再开始HTTP推送。"
+            else:
+                text = (f"输出CH7 ← CH{source7}；输出CH8 ← CH{source8}；前6路保持原通道。\n"
+                        "HTTP仅使用6路独立来源；本地波形与原始记录仍为物理8路。")
+            self.http_channel_summary.setText(text)
+            self.http_channel_summary.setStyleSheet("" if mapping_valid else "color:#d9a441")
 
         def _refresh_http_status(self) -> None:
             sender = self.http_sender
@@ -2040,6 +2112,7 @@ if QtWidgets is not None:
             seconds = float(self.window_combo.currentData())
             times, values = self.model.plot_data(seconds)
             if not len(times):
+                self._refresh_spectrum(values)
                 return
             relative_times = times - times[-1]
             display_values = _display_dc_removed(values, self.model.sampling_rate)
@@ -2068,22 +2141,33 @@ if QtWidgets is not None:
                 self.marker_lines[channel] = lines
                 self.pause_labels[channel].setPos(-seconds / 2.0, center)
 
-            selected = self.fft_channel.currentIndex()
-            centered = values[:, selected] - np.mean(values[:, selected])
-            if len(centered) >= 8:
-                window = np.hanning(len(centered))
-                frequencies = np.fft.rfftfreq(len(centered), d=1.0 / self.model.sampling_rate)
-                magnitude = np.abs(np.fft.rfft(centered * window)) * 2.0 / max(1.0, window.sum())
-                keep = frequencies <= 60.0
-                self.spectrum_curve.setData(frequencies[keep], magnitude[keep])
-                non_dc = np.flatnonzero((frequencies > 0.5) & keep)
-                if len(non_dc):
-                    peak = non_dc[int(np.argmax(magnitude[non_dc]))]
-                    self.fft_peak.setText(f"主峰：{frequencies[peak]:.2f} Hz / {magnitude[peak]:.2f} µV")
+            self._refresh_spectrum(values)
             latest = values[-1]
             self.latest_values.setText(
                 "  ".join(f"CH{index + 1} {latest[index]:+.2f}µV" for index in range(CHANNELS))
             )
+
+        def _refresh_spectrum(self, values: np.ndarray | None = None) -> None:
+            maximum = min(float(self.fft_range_combo.currentData()), self.model.sampling_rate / 2.0)
+            self.spectrum.setTitle(f"0–{maximum:g} Hz FFT", size="12pt")
+            self.spectrum.setXRange(0.0, maximum, padding=0.0)
+            if values is None:
+                _, values = self.model.plot_data(float(self.window_combo.currentData()))
+            self.fft_peak.setText("主峰：--")
+            if len(values) < 8:
+                self.spectrum_curve.setData([], [])
+                return
+            selected = self.fft_channel.currentIndex()
+            centered = values[:, selected] - np.mean(values[:, selected])
+            window = np.hanning(len(centered))
+            frequencies = np.fft.rfftfreq(len(centered), d=1.0 / self.model.sampling_rate)
+            magnitude = np.abs(np.fft.rfft(centered * window)) * 2.0 / max(1.0, window.sum())
+            keep = frequencies <= maximum
+            self.spectrum_curve.setData(frequencies[keep], magnitude[keep])
+            non_dc = np.flatnonzero((frequencies > 0.5) & keep)
+            if len(non_dc):
+                peak = non_dc[int(np.argmax(magnitude[non_dc]))]
+                self.fft_peak.setText(f"主峰：{frequencies[peak]:.2f} Hz / {magnitude[peak]:.2f} µV")
 
         def _refresh_diagnostics(self) -> None:
             now = time.monotonic()

@@ -18,7 +18,13 @@ from tools.p300_common import CHANNELS, EegBatch
 from tools.p300_self_test import CONFIG_NORMAL
 
 
-HTTP_SETTINGS_VERSION = 1
+HTTP_SETTINGS_VERSION = 2
+HTTP_CHANNEL_MODE_RAW = "raw8"
+HTTP_CHANNEL_MODE_SIX = "six_to_eight"
+HTTP_CHANNEL_MODES = (
+    ("原始8通道", HTTP_CHANNEL_MODE_RAW),
+    ("特殊：CH1–CH6 + 两路复制", HTTP_CHANNEL_MODE_SIX),
+)
 HTTP_PACKET_SAMPLES = 200
 HTTP_INPUT_BATCH_SAMPLES = 20
 HTTP_TIMEOUT_S = 2.0
@@ -39,6 +45,9 @@ class HttpPushSettings:
     server_ip: str = DEFAULT_HTTP_SERVER_IP
     port: int = DEFAULT_HTTP_SERVER_PORT
     endpoint: str = DEFAULT_HTTP_ENDPOINT
+    channel_mode: str = HTTP_CHANNEL_MODE_RAW
+    channel7_source: int = 5
+    channel8_source: int = 6
 
     @classmethod
     def defaults(cls) -> "HttpPushSettings":
@@ -65,7 +74,21 @@ class HttpPushSettings:
             raise ValueError("endpoint必须以/开头")
         if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in endpoint):
             raise ValueError("endpoint不能包含空白或控制字符")
-        return HttpPushSettings(str(address), port, endpoint)
+        if self.channel_mode not in (HTTP_CHANNEL_MODE_RAW, HTTP_CHANNEL_MODE_SIX):
+            raise ValueError("HTTP通道模式无效")
+        for source in (self.channel7_source, self.channel8_source):
+            if isinstance(source, bool) or not isinstance(source, int) or not 1 <= source <= 6:
+                raise ValueError("输出CH7/CH8来源必须为CH1–CH6")
+        if self.channel_mode == HTTP_CHANNEL_MODE_SIX and self.channel7_source == self.channel8_source:
+            raise ValueError("输出CH7和CH8请选择两个不同的来源通道")
+        return HttpPushSettings(str(address), port, endpoint, self.channel_mode,
+                                self.channel7_source, self.channel8_source)
+
+    @property
+    def channel_map(self) -> tuple[int, ...]:
+        if self.channel_mode == HTTP_CHANNEL_MODE_RAW:
+            return tuple(range(1, CHANNELS + 1))
+        return (*range(1, 7), self.channel7_source, self.channel8_source)
 
     @property
     def url(self) -> str:
@@ -81,12 +104,19 @@ class HttpPushSettings:
             document = json.loads(source.read_text(encoding="utf-8"))
             if not isinstance(document, dict):
                 raise ValueError("配置根节点必须是JSON对象")
-            if document.get("version") != HTTP_SETTINGS_VERSION:
+            version = document.get("version")
+            if type(version) is not int or version not in (1, HTTP_SETTINGS_VERSION):
                 raise ValueError(f"不支持的HTTP配置版本：{document.get('version')!r}")
+            mapping = {} if version == 1 else {
+                "channel_mode": document.get("channel_mode", HTTP_CHANNEL_MODE_RAW),
+                "channel7_source": document.get("channel7_source", 5),
+                "channel8_source": document.get("channel8_source", 6),
+            }
             settings = cls(
                 document.get("server_ip", ""),
                 document.get("port", 0),
                 document.get("endpoint", ""),
+                **mapping,
             ).normalized()
             return settings, None
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
@@ -102,6 +132,9 @@ class HttpPushSettings:
             "server_ip": settings.server_ip,
             "port": settings.port,
             "endpoint": settings.endpoint,
+            "channel_mode": settings.channel_mode,
+            "channel7_source": settings.channel7_source,
+            "channel8_source": settings.channel8_source,
         }
         try:
             temporary.write_text(
@@ -114,6 +147,21 @@ class HttpPushSettings:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def map_http_channels(payload: dict, settings: HttpPushSettings) -> dict:
+    """Map a completed HTTP packet without mutating the acquired/recorded data."""
+    settings = settings.normalized()
+    if settings.channel_mode == HTTP_CHANNEL_MODE_RAW:
+        return payload
+    data = payload.get("data")
+    if payload.get("channels") != CHANNELS or not isinstance(data, list) or any(
+        not isinstance(row, list) or len(row) != CHANNELS for row in data
+    ):
+        raise ValueError("通道映射需要8列原始EEG数据")
+    mapping = settings.channel_map
+    return {**payload, "data": [[row[index - 1] for index in mapping] for row in data],
+            "channel_mode": settings.channel_mode, "channel_map": list(mapping)}
 
 
 class HttpPacketAggregator:

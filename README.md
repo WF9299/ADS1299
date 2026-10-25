@@ -25,6 +25,13 @@ ADS1299 → ESP32-C5 → USB 串口 / Wi-Fi TCP → P300 Monitor
 
 ## 快速开始
 
+从 GitHub 获取完整项目：
+
+```powershell
+git clone https://github.com/WF9299/ADS1299.git
+cd ADS1299
+```
+
 在仓库根目录使用 Python 3.11 或更新版本安装两端依赖并启动 Monitor：
 
 ```powershell
@@ -48,6 +55,8 @@ python firmware/tools/p300_monitor.py --host 0.0.0.0 --port 1234
 ## 当前功能
 
 - **采集与诊断**：USB/Wi-Fi 双传输、Marker、通道质量、阻抗、内部短接、发送分组、记录和原始 EEG HTTP 输出。
+- **特殊 HTTP 推送**：仅取 CH1–CH6 的原始值，输出 CH7/CH8 分别复制从前六路选择的两个不同通道；保留 8 列接收格式，本地仍采集和记录物理 8 路。入口为 **记录 → HTTP → 通道模式**。
+- **频谱范围**：频谱页支持 0–60 Hz / 0–120 Hz 切换，默认 0–60 Hz；曲线和主峰搜索同步更新。
 - **显示滤波**：原始、工频抑制、P300 0.5–30 Hz、P300 2–30 Hz、SSVEP 6–90 Hz。显示/FFT 滤波不改变原始记录和 HTTP 数据。
 - **BIAS 启停**：2.2.0 固件支持正常 EEG 模式下独立关闭/开启 BIAS 放大器，USB 与 Wi-Fi 均可控制，并回读寄存器确认。
 - **SSVEP**：黑色全屏、中央 5 cm 方块持续闪烁；MATLAB 参考四谐波 CCA 与 FBCCA 对照；分析候选随当前刺激取 ±4 Hz、0.5 Hz 步进；实时相关系数柱状图和质量/PSD。
@@ -62,8 +71,12 @@ SSVEP 闪烁期间，**←/→** 以 0.5 Hz 步进切换，**Home** 回初始频
 - SSVEP 安装、滤波、快捷键与记录：[ssvep_realtime_test/README.md](ssvep_realtime_test/README.md)。
 - 已有固件验证（2026-10-22）：92 项 Python 测试、主机 C 协议测试和 ESP-IDF 6.0.2 编译通过；BIASOUT 实板电气效果尚待验证。
 - 整合验证（2026-10-23）：在本仓库目录运行 SSVEP 51 项测试全部通过；两端启动入口、固件范围检查与文档链接检查通过。
+- 特殊推送验证（2026-10-23）：Monitor 97 项、SSVEP 53 项测试通过，包含真实本机 HTTP、映射校验、切换清窗和映射记录验证。
+- GitHub 发布验证（2026-10-25）：Monitor 97 项、SSVEP 53 项回归全部通过；包含特殊推送和频谱范围更新。
 - 本次整合只增加独立 SSVEP 程序和中文说明，不修改固件采样与控制代码。软件测试不能替代实际电极质量与刺激时序测量。
 
 本机 `app_config.h`、HTTP/SSVEP 设置、尺寸校准、实验数据及编译产物均不提交。首次编译需从 `app_config.example.h` 复制采集配置；Wi-Fi 名称、密码和 PC 地址通过 Monitor USB 配网写入设备。
+
+GitHub：[WF9299/ADS1299](https://github.com/WF9299/ADS1299)。
 
 GitLab：[ads1299_esp32c5_tong_v1](http://10.201.1.182:1081/zhaoboyuan/ads1299_esp32c5_tong_v1)。

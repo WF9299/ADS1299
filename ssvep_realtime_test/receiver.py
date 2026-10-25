@@ -15,6 +15,23 @@ MAX_BYTES = 2_000_000
 PHASES = {"baseline": 1, "response": 2, "test": 3}
 
 
+def channel_metadata(payload):
+    """Old packets implicitly contain physical CH1–CH8 in their original order."""
+    mode = payload.get("channel_mode", "raw8")
+    mapping = payload.get("channel_map", list(range(1, 9)))
+    if not isinstance(mapping, list) or len(mapping) != 8 or any(type(ch) is not int for ch in mapping):
+        raise ValueError("channel_map 必须为8项整数通道编号")
+    if mode == "raw8":
+        valid = mapping == list(range(1, 9))
+    elif mode == "six_to_eight":
+        valid = mapping[:6] == list(range(1, 7)) and all(1 <= ch <= 6 for ch in mapping[6:]) and mapping[6] != mapping[7]
+    else:
+        raise ValueError("未知的HTTP通道模式")
+    if not valid:
+        raise ValueError("channel_map 与HTTP通道模式不一致")
+    return {"channel_mode": mode, "channel_map": list(mapping)}
+
+
 def validate_packet(payload):
     if not isinstance(payload, dict):
         raise ValueError("需要 JSON 对象")
@@ -49,7 +66,7 @@ def validate_packet(payload):
             raise ValueError("ADS1299 参考电压或 PGA 增益超出支持范围")
     return {"data": data, "sampling_rate": int(fs), "timestamp": float(ts), "units": "uV",
             **({"markers": payload["markers"]} if "markers" in payload else {}),
-            "device": payload.get("device", "unknown"), **metadata,
+            "device": payload.get("device", "unknown"), **metadata, **channel_metadata(payload),
             "simulation": payload.get("device") == "SSVEP_SIMULATOR"}
 
 
@@ -212,10 +229,15 @@ def worker_main(settings_dict, results, ready, stop, start_epoch, phase_value, c
                     context = {"sampling_rate": fs, "simulation": packet["simulation"], "fullscale_uv": fullscale,
                                "metadata_known": known, "vref_v": packet.get("vref_v"), "pga_gain": packet.get("pga_gain"),
                                "device": packet["device"]}
+                    if packet["channel_mode"] != "raw8":
+                        # Keep legacy physical-channel calibration contexts
+                        # compatible, while mapped inputs get a distinct scope.
+                        context.update(channel_mode=packet["channel_mode"], channel_map=packet["channel_map"])
                     calibration.set_context(context)
                     analyzer.fullscale = fullscale
                     analyzer.range_source = "Monitor 实际量程" if known else "配置量程（未收到 Monitor 元信息）"
-                    key = (fs, packet["simulation"], fullscale, known, packet.get("vref_v"), packet.get("pga_gain"), packet["device"])
+                    key = (fs, packet["simulation"], fullscale, known, packet.get("vref_v"), packet.get("pga_gain"),
+                           packet["device"], tuple(packet["channel_map"]))
                     discontinuity = stream_key != key or (expected is not None and abs(ts - expected) > 2.5 / fs)
                     if discontinuity:
                         analyzer.reset()
